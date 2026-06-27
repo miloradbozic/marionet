@@ -78,3 +78,15 @@ Secrets go in `.env` (gitignored). `tsx --env-file=.env` loads them into the Nod
 **Add a new MCP server**: add it to `config/run.config.json` under `mcpServers`. It will be spawned as a stdio subprocess and its tools auto-registered.
 
 **Change the model or ceilings**: edit `config/run.config.json` (`model`, `maxTurns`, `maxCostUsd`, `maxTokens`). Pricing constants for cost estimation live in `src/anthropic-client.ts` and need manual updates if the model changes.
+
+## Future directions
+
+These were identified through experimentation but not yet implemented on main. Branches `experiment/faster-browser-loop` (Haiku + no-verify prompt) and `experiment/plan-then-execute` (`plan_steps` tool) exist for reference.
+
+**Extended thinking + upfront page snapshot.** The core bottleneck is the perceive-decide-act cycle: every observation costs a full API round trip. The hypothesis is to give the model a rich initial snapshot (full DOM, accessibility tree, or screenshot) at the start of a flow, let it reason through the entire sequence in one extended thinking pass, and emit all tool calls without intermediate observations. Different from `plan_steps` because the model plans from real page state rather than guessing selectors.
+
+**Selector memory across runs.** The model rediscovers CSS selectors for the same site on every run. Storing working selectors per site/page in a persistent file (e.g. `workspace/selectors.json`) would let future runs skip the discovery step and fail less often on first attempt.
+
+**Computer use (vision-based clicks).** Instead of DOM extraction + CSS selectors, give the model a screenshot and let it click by pixel coordinates. Removes the "find the right selector" failure mode entirely. Anthropic's computer use API supports this. Trade-off: slower per action, but more robust on sites with unstable or obfuscated DOM.
+
+**Streaming tool execution.** Currently the loop waits for the full model response before executing any tool. With streaming, tool calls could be dispatched as soon as they appear in the stream, shaving 1-2s off each turn by overlapping model generation with tool execution.
