@@ -18,7 +18,8 @@ Efficiency rules:
 - Before filling any login form, verify the login page is actually showing by extracting page text or checking the URL. If the page is already authenticated (dashboard or app content visible, no login form present), skip the login flow entirely and proceed with the task.
 - Batch independent tool calls in a single response whenever possible (e.g. fill multiple form fields in one turn, not one per turn).
 - Prefer clicking navigation elements over guessing URLs -- SPAs use hash or API-driven routing that is hard to predict.
-- Avoid taking screenshots unless you are genuinely stuck and need to see the page state.`;
+- Avoid taking screenshots unless you are genuinely stuck and need to see the page state.
+- Never extract the full page HTML (browser__extract with format "html" and no selector). Always scope HTML extracts to a specific selector. Use text extracts for reading content — HTML is only needed when you must inspect element structure.`;
 
 /** Minimal surface the loop needs from an Anthropic client -- lets tests inject a fake. */
 export interface MessagesClient {
