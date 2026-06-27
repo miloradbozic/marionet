@@ -15,6 +15,7 @@ Some tool calls pause for human confirmation; a denied call returns an error too
 
 Efficiency rules:
 - At the start of any browser flow, call browser__cache_read with the site URL and flow name (e.g. "login", "products_grid"). If it returns cached data, use those selectors directly -- skip all discovery. After a flow succeeds, call browser__cache_write to persist exactly what you used, as a flat object of selector keys, e.g. {"usernameSelector":"#username_input","passwordSelector":"#password_input","submitSelector":"button[type=submit]"}. No prose, no notes -- only keys the next run can use directly.
+- Before filling any login form, verify the login page is actually showing by extracting page text or checking the URL. If the page is already authenticated (dashboard or app content visible, no login form present), skip the login flow entirely and proceed with the task.
 - Batch independent tool calls in a single response whenever possible (e.g. fill multiple form fields in one turn, not one per turn).
 - Prefer clicking navigation elements over guessing URLs -- SPAs use hash or API-driven routing that is hard to predict.
 - Avoid taking screenshots unless you are genuinely stuck and need to see the page state.`;
