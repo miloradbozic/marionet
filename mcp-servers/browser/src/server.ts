@@ -137,6 +137,31 @@ server.registerTool(
 );
 
 server.registerTool(
+  "browser__fill_from_env",
+  {
+    description:
+      "Fill a text input with a value read from an environment variable on the local machine. Use this instead of browser__fill whenever the value is a secret (password, API key, etc.) so the actual secret is never sent to the model.",
+    inputSchema: {
+      selector: z.string(),
+      env_var: z.string().describe("Name of the environment variable whose value will be typed into the field"),
+    },
+  },
+  async ({ selector, env_var }) => {
+    try {
+      const value = process.env[env_var];
+      if (value === undefined) {
+        return { content: [{ type: "text" as const, text: `Error: environment variable "${env_var}" is not set` }], isError: true };
+      }
+      const p = await getPage();
+      await p.fill(selector, value, { timeout: 15_000 });
+      return { content: [{ type: "text" as const, text: `Filled ${selector} from env var ${env_var}` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
   "browser__select",
   {
     description: "Select an option in a <select> dropdown by its visible label or value.",

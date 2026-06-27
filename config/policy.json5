@@ -30,6 +30,8 @@
     { match: "browser__navigate", action: "allow" },
     { match: "browser__click", action: "allow" },
     { match: "browser__fill", action: "allow" },
+    // fill_from_env resolves secrets locally -- the value never reaches the model.
+    { match: "browser__fill_from_env", action: "allow" },
     { match: "browser__select", action: "allow" },
     { match: "browser__extract", action: "allow" },
     { match: "browser__download", action: "allow" },

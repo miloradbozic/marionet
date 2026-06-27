@@ -33,7 +33,7 @@ export class McpClientManager {
         command: serverConfig.command,
         args: serverConfig.args,
         cwd,
-        env: { ...getDefaultEnvironment(), MARIONET_BROWSER_CDP_ENDPOINT: browserCdpEndpoint },
+        env: { ...process.env, ...getDefaultEnvironment(), MARIONET_BROWSER_CDP_ENDPOINT: browserCdpEndpoint },
       });
       const client = new Client({ name: "marionet-orchestrator", version: "0.1.0" });
       await client.connect(transport);
