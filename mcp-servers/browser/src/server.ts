@@ -180,17 +180,38 @@ server.registerTool(
   },
 );
 
+// Works for: standard HTML forms where a [type=submit] button/input is a
+// descendant of `selector`. Clicking p.click(selector) on a <form> element
+// itself does nothing in Playwright -- you must click the submit control.
+//
+// Does NOT work for:
+//   - JS-driven forms with no native submit button (need browser__click on a
+//     custom element instead)
+//   - Submit buttons that live outside the <form> tag (pass their selector
+//     directly to browser__click)
+//   - Multi-step wizard forms where "next" != "submit"
+//
+// When broadening this: consider accepting an optional explicit submitSelector
+// so callers can point directly at the button when the heuristic fails.
 server.registerTool(
   "browser__submit_form",
   {
     description:
-      "Submit a form by clicking its submit control. Sends data externally (messages/payments/etc) -- gated by policy as a human checkpoint.",
+      "Submit a form by clicking its [type=submit] button. Pass the selector of the form container or the submit button itself. Sends data externally (messages/payments/etc) -- gated by policy as a human checkpoint.",
     inputSchema: { selector: z.string() },
   },
   async ({ selector }) => {
     try {
       const p = await getPage();
-      await p.click(selector, { timeout: 15_000 });
+      // Try the selector as-is first (works if it's already the submit button).
+      // Fall back to finding [type=submit] within it (works if it's the <form>).
+      const submitLocator = p.locator(`${selector} [type=submit]`).first();
+      const hasSubmitChild = await submitLocator.count() > 0;
+      if (hasSubmitChild) {
+        await submitLocator.click({ timeout: 10_000 });
+      } else {
+        await p.click(selector, { timeout: 10_000 });
+      }
       return { content: [{ type: "text" as const, text: `Submitted form via ${selector}` }] };
     } catch (err) {
       return errorResult(err);

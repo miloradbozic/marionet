@@ -11,7 +11,12 @@ const SYSTEM_PROMPT = `You are marionet, an autonomous agent with shell, filesys
 
 When the task is complete, or you determine it cannot be completed, you must call finish_task -- do not just stop responding or produce a final text-only answer. That is the only way this run ends.
 
-Some tool calls pause for human confirmation; a denied call returns an error tool_result explaining why. If one is denied, adapt your approach rather than retrying the same call, or call finish_task with status "blocked".`;
+Some tool calls pause for human confirmation; a denied call returns an error tool_result explaining why. If one is denied, adapt your approach rather than retrying the same call, or call finish_task with status "blocked".
+
+Efficiency rules:
+- Batch independent tool calls in a single response whenever possible (e.g. fill multiple form fields in one turn, not one per turn).
+- Prefer clicking navigation elements over guessing URLs -- Akeneo and similar SPAs use hash or API-driven routing that is hard to predict.
+- Avoid taking screenshots unless you are genuinely stuck and need to see the page state.`;
 
 /** Minimal surface the loop needs from an Anthropic client -- lets tests inject a fake. */
 export interface MessagesClient {
