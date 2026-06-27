@@ -67,6 +67,10 @@ Both servers are in `mcp-servers/` and are separate npm workspaces (`mcp-servers
 
 Secrets go in `.env` (gitignored). `tsx --env-file=.env` loads them into the Node process; `McpClientManager` forwards `process.env` to MCP subprocesses so `browser__fill_from_env` can read them. The pattern: the model specifies the **env var name**, not the value — so secrets never appear in the LLM conversation.
 
+## Prompting tips
+
+**SPAs: direct to nav clicks, not URLs.** SPAs (React, Angular, Akeneo, Salesforce, etc.) use hash or API-driven routing where URLs are hard to predict. If a prompt says "navigate to the Products page", the model will guess a URL, get a 404, and recover via the sidebar anyway — wasting turns. Say "click the Products link in the left sidebar" instead. General rule: for any SPA, tell the agent *where to click*, not *where to go*.
+
 ## Extending
 
 **Add a new tool**: register it in the relevant MCP server (`server.registerTool(...)`), then add a policy rule for it in `config/policy.json5` (it will be denied by default).
