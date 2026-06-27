@@ -1,0 +1,21 @@
+{
+  "model": "claude-sonnet-4-6",
+  "maxTokens": 4096,
+  "maxTurns": 40,
+  "maxCostUsd": 2.0,
+  "browser": {
+    "cdpEndpoint": "http://localhost:9222"
+  },
+  "mcpServers": [
+    {
+      "name": "core",
+      "command": "npx",
+      "args": ["tsx", "mcp-servers/core/src/server.ts"]
+    },
+    {
+      "name": "browser",
+      "command": "npx",
+      "args": ["tsx", "mcp-servers/browser/src/server.ts"]
+    }
+  ]
+}
