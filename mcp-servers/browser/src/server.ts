@@ -219,5 +219,64 @@ server.registerTool(
   },
 );
 
+const CACHE_PATH = path.join(WORKSPACE_ROOT, "browser-cache.json");
+
+type CacheFile = Record<string, Record<string, Record<string, unknown>>>;
+
+async function readCache(): Promise<CacheFile> {
+  try {
+    return JSON.parse(await fs.readFile(CACHE_PATH, "utf-8")) as CacheFile;
+  } catch {
+    return {};
+  }
+}
+
+server.registerTool(
+  "browser__cache_read",
+  {
+    description:
+      "Read cached browser automation data (selectors, nav steps, etc.) for a site+flow from workspace/browser-cache.json. Call this at the start of any flow before doing discovery. Returns the cached object, or a cache-miss message if nothing is stored yet.",
+    inputSchema: {
+      site: z.string().describe("Base URL of the site, e.g. https://example.com"),
+      flow: z.string().describe("Flow name, e.g. 'login', 'products_grid'"),
+    },
+  },
+  async ({ site, flow }) => {
+    try {
+      const cache = await readCache();
+      const data = cache[site]?.[flow];
+      if (!data) return { content: [{ type: "text" as const, text: `cache miss: no data for ${site} / ${flow}` }] };
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__cache_write",
+  {
+    description:
+      "Persist browser automation data (selectors, nav steps, etc.) for a site+flow to workspace/browser-cache.json. Call this after a flow succeeds so future runs can skip discovery.",
+    inputSchema: {
+      site: z.string().describe("Base URL of the site, e.g. https://example.com"),
+      flow: z.string().describe("Flow name, e.g. 'login', 'products_grid'"),
+      data: z.record(z.string(), z.unknown()).describe("Selectors and other info to cache for this flow"),
+    },
+  },
+  async ({ site, flow, data }) => {
+    try {
+      await fs.mkdir(WORKSPACE_ROOT, { recursive: true });
+      const cache = await readCache();
+      cache[site] ??= {};
+      cache[site][flow] = data;
+      await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2));
+      return { content: [{ type: "text" as const, text: `Cached ${site} / ${flow}` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
