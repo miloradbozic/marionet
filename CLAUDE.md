@@ -1,0 +1,76 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+```bash
+npm run marionet -- run "<task>"   # run the agent
+npm run marionet -- transcript     # render latest run to markdown (useful if run was killed)
+npm run marionet -- transcript <run-id>
+
+npm run typecheck                  # type-check orchestrator + both MCP workspaces
+npm test                           # vitest unit tests (orchestrator only; no browser/shell)
+```
+
+Before any browser task, start Chrome with the debug port in a separate terminal:
+```bash
+google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/marionet-chrome
+```
+
+## Architecture
+
+Marionet is a thin agentic loop around the Anthropic API. It gives the model shell, filesystem, and browser access via MCP servers, then controls what it's allowed to do through a policy engine.
+
+```
+cli.ts
+ ├── McpClientManager   – spawns MCP servers as stdio subprocesses, routes tool calls
+ ├── PolicyEngine       – evaluates every tool call before execution; fail-closed
+ ├── runAgentLoop       – the core loop: call API → handle tool calls → repeat
+ └── RunLogger          – append-only events.jsonl + meta.json per run
+```
+
+### Agent loop (`src/loop/agent-loop.ts`)
+
+One iteration = one Anthropic API call. The loop handles three cases per response:
+- **Tool calls** → evaluate each against policy, execute via MCP, feed results back
+- **No tool calls** → inject a nudge message and continue (up to `maxTurns + nudges` total)
+- **`finish_task` call** → return immediately with status/summary
+
+`finish_task` is the only exit path. The loop never exits on a text-only response. `process.exit()` is called explicitly in `cli.ts` after MCP teardown because the browser server holds an open CDP WebSocket that would otherwise keep Node alive.
+
+### Policy engine (`src/policy/`)
+
+`config/policy.json5` is evaluated top-to-bottom, first-match-wins, with a deny-all catch-all at the end. Rules match on tool name (glob) and optionally on args (regex per field). The policy is snapshotted into `meta.json` at run start so past gating decisions stay auditable even after the file changes.
+
+Actions: `allow` (run unattended) | `ask` (pause for human y/n/a) | `deny` (return error to model).
+
+The `a` (always-allow) choice is in-memory only for the current run — it never writes back to `policy.json5`.
+
+### MCP servers
+
+Both servers are in `mcp-servers/` and are separate npm workspaces (`mcp-servers/core`, `mcp-servers/browser`). They're spawned by `McpClientManager` with the full `process.env` forwarded (so `.env` vars are available inside tools, including `browser__fill_from_env`).
+
+**core** (`mcp-servers/core/src/server.ts`): `shell__exec`, `fs__read`, `fs__write`, `fs__list`. Shell commands run in `workspace/` by default.
+
+**browser** (`mcp-servers/browser/src/server.ts`): Attaches to an already-running Chrome over CDP (`MARIONET_BROWSER_CDP_ENDPOINT`, default `http://localhost:9222`). Never launches its own browser. Key tools:
+- `browser__fill_from_env` — fills an input from a named env var; the secret value never reaches the model. Use this instead of `browser__fill` for passwords/API keys.
+- `browser__submit_form` — finds `[type=submit]` within the given selector and clicks it. Works for standard HTML forms; does **not** work for JS-driven forms with no native submit button, or submit buttons outside the `<form>` tag (use `browser__click` directly in those cases). If broadening: consider an explicit `submitSelector` param.
+
+### Logging (`runs/<run-id>/`)
+
+- `events.jsonl` — append-only source of truth; survives crashes
+- `meta.json` — run metadata + policy snapshot at run time
+- `transcript.md` — rendered markdown summary (written on clean exit; use `marionet transcript` to render from events if the run was killed)
+
+### Credential handling
+
+Secrets go in `.env` (gitignored). `tsx --env-file=.env` loads them into the Node process; `McpClientManager` forwards `process.env` to MCP subprocesses so `browser__fill_from_env` can read them. The pattern: the model specifies the **env var name**, not the value — so secrets never appear in the LLM conversation.
+
+## Extending
+
+**Add a new tool**: register it in the relevant MCP server (`server.registerTool(...)`), then add a policy rule for it in `config/policy.json5` (it will be denied by default).
+
+**Add a new MCP server**: add it to `config/run.config.json` under `mcpServers`. It will be spawned as a stdio subprocess and its tools auto-registered.
+
+**Change the model or ceilings**: edit `config/run.config.json` (`model`, `maxTurns`, `maxCostUsd`, `maxTokens`). Pricing constants for cost estimation live in `src/anthropic-client.ts` and need manual updates if the model changes.
