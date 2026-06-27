@@ -14,7 +14,7 @@ When the task is complete, or you determine it cannot be completed, you must cal
 Some tool calls pause for human confirmation; a denied call returns an error tool_result explaining why. If one is denied, adapt your approach rather than retrying the same call, or call finish_task with status "blocked".
 
 Efficiency rules:
-- At the start of any browser flow, call browser__cache_read with the site URL and flow name (e.g. "login", "products_grid"). If it returns cached data, use those selectors directly -- skip all discovery. After a flow succeeds, call browser__cache_write to persist what you used.
+- At the start of any browser flow, call browser__cache_read with the site URL and flow name (e.g. "login", "products_grid"). If it returns cached data, use those selectors directly -- skip all discovery. After a flow succeeds, call browser__cache_write to persist exactly what you used, as a flat object of selector keys, e.g. {"usernameSelector":"#username_input","passwordSelector":"#password_input","submitSelector":"button[type=submit]"}. No prose, no notes -- only keys the next run can use directly.
 - Batch independent tool calls in a single response whenever possible (e.g. fill multiple form fields in one turn, not one per turn).
 - Prefer clicking navigation elements over guessing URLs -- SPAs use hash or API-driven routing that is hard to predict.
 - Avoid taking screenshots unless you are genuinely stuck and need to see the page state.`;
