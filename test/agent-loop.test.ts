@@ -1,46 +1,43 @@
 import { describe, expect, it, vi } from "vitest";
-import type Anthropic from "@anthropic-ai/sdk";
-import { runAgentLoop, type MessagesClient } from "../src/loop/agent-loop.js";
+import type OpenAI from "openai";
+import { runAgentLoop, type LlmMessagesClient } from "../src/loop/agent-loop.js";
 import type { McpClientManager, McpToolResult } from "../src/mcp/mcp-client-manager.js";
 import type { PolicyEngine } from "../src/policy/policy-engine.js";
 import type { RunLogger } from "../src/logging/run-logger.js";
 import type { PolicyDecision } from "../src/policy/policy.types.js";
 
-function makeMessage(content: Anthropic.ContentBlock[]): Anthropic.Message {
+function makeCompletion(
+  text: string | null,
+  toolCalls: OpenAI.ChatCompletionMessageToolCall[],
+): OpenAI.ChatCompletion {
   return {
-    id: "msg_test",
-    container: null,
-    content,
-    model: "claude-sonnet-4-6",
-    role: "assistant",
-    stop_details: null,
-    stop_reason: content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn",
-    stop_sequence: null,
-    type: "message",
-    usage: {
-      cache_creation: null,
-      cache_creation_input_tokens: null,
-      cache_read_input_tokens: null,
-      inference_geo: null,
-      input_tokens: 100,
-      output_tokens: 50,
-      output_tokens_details: null,
-      server_tool_use: null,
-      service_tier: null,
-    },
+    id: "chatcmpl_test",
+    object: "chat.completion",
+    created: 0,
+    model: "test-model",
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: text,
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+          refusal: null,
+        },
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
+        logprobs: null,
+      },
+    ],
+    usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
   };
 }
 
-function textBlock(text: string): Anthropic.TextBlock {
-  return { type: "text", text, citations: null };
+function toolCall(id: string, name: string, input: unknown): OpenAI.ChatCompletionMessageToolCall {
+  return { id, type: "function", function: { name, arguments: JSON.stringify(input) } };
 }
 
-function toolUseBlock(id: string, name: string, input: unknown): Anthropic.ToolUseBlock {
-  return { type: "tool_use", id, name, input, caller: { type: "direct" } };
-}
-
-function finishTaskMessage(status: "success" | "failure" | "blocked", summary: string): Anthropic.Message {
-  return makeMessage([toolUseBlock("toolu_finish", "finish_task", { status, summary })]);
+function finishTaskCompletion(status: "success" | "failure" | "blocked", summary: string): OpenAI.ChatCompletion {
+  return makeCompletion(null, [toolCall("tc_finish", "finish_task", { status, summary })]);
 }
 
 function fakeLogger(): RunLogger {
@@ -54,17 +51,18 @@ function fakePolicy(action: PolicyDecision["action"] = "allow"): PolicyEngine {
 }
 
 function fakeMcpManager(callTool: (name: string, args: Record<string, unknown>) => Promise<McpToolResult>): McpClientManager {
-  return { anthropicTools: [], callTool } as unknown as McpClientManager;
+  return { tools: [], callTool } as unknown as McpClientManager;
 }
 
 function baseOptions(overrides: Partial<Parameters<typeof runAgentLoop>[0]> = {}) {
   return {
     task: "do the thing",
-    model: "claude-sonnet-4-6",
+    model: "test-model",
     maxTokens: 4096,
     maxTurns: 10,
     maxCostUsd: 10,
-    anthropicClient: { messages: { create: vi.fn() } } as unknown as MessagesClient,
+    pricing: { input: 3.0, output: 15.0 },
+    llmClient: { chat: { completions: { create: vi.fn() } } } as unknown as LlmMessagesClient,
     mcpClientManager: fakeMcpManager(async () => ({ content: [{ type: "text", text: "ok" }] })),
     policy: fakePolicy("allow"),
     logger: fakeLogger(),
@@ -74,9 +72,9 @@ function baseOptions(overrides: Partial<Parameters<typeof runAgentLoop>[0]> = {}
 
 describe("runAgentLoop", () => {
   it("ends the run as soon as finish_task is called", async () => {
-    const create = vi.fn().mockResolvedValue(finishTaskMessage("success", "All done."));
+    const create = vi.fn().mockResolvedValue(finishTaskCompletion("success", "All done."));
     const result = await runAgentLoop(
-      baseOptions({ anthropicClient: { messages: { create } } as unknown as MessagesClient }),
+      baseOptions({ llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient }),
     );
     expect(result).toEqual({ status: "success", summary: "All done.", details: undefined });
     expect(create).toHaveBeenCalledTimes(1);
@@ -85,13 +83,13 @@ describe("runAgentLoop", () => {
   it("routes an allowed tool call through the MCP manager, then finishes on the next turn", async () => {
     const create = vi
       .fn()
-      .mockResolvedValueOnce(makeMessage([toolUseBlock("toolu_1", "shell__exec", { command: "ls" })]))
-      .mockResolvedValueOnce(finishTaskMessage("success", "Listed files."));
+      .mockResolvedValueOnce(makeCompletion(null, [toolCall("tc_1", "shell__exec", { command: "ls" })]))
+      .mockResolvedValueOnce(finishTaskCompletion("success", "Listed files."));
     const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "file1\nfile2" }] });
 
     const result = await runAgentLoop(
       baseOptions({
-        anthropicClient: { messages: { create } } as unknown as MessagesClient,
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
         mcpClientManager: fakeMcpManager(callTool),
       }),
     );
@@ -101,16 +99,16 @@ describe("runAgentLoop", () => {
     expect(create).toHaveBeenCalledTimes(2);
   });
 
-  it("never executes a tool the policy denies, and surfaces the denial as an error tool_result", async () => {
+  it("never executes a tool the policy denies, and surfaces the denial as an error tool result", async () => {
     const create = vi
       .fn()
-      .mockResolvedValueOnce(makeMessage([toolUseBlock("toolu_1", "payments__charge_card", { amount: 100 })]))
-      .mockResolvedValueOnce(finishTaskMessage("blocked", "Could not charge card -- denied."));
+      .mockResolvedValueOnce(makeCompletion(null, [toolCall("tc_1", "payments__charge_card", { amount: 100 })]))
+      .mockResolvedValueOnce(finishTaskCompletion("blocked", "Could not charge card -- denied."));
     const callTool = vi.fn();
 
     const result = await runAgentLoop(
       baseOptions({
-        anthropicClient: { messages: { create } } as unknown as MessagesClient,
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
         mcpClientManager: fakeMcpManager(callTool),
         policy: fakePolicy("deny"),
       }),
@@ -119,23 +117,18 @@ describe("runAgentLoop", () => {
     expect(callTool).not.toHaveBeenCalled();
     expect(result.status).toBe("blocked");
 
-    // the denial must have been reported back to the model as an error tool_result.
-    // Note: `messages` is mutated in place across iterations and mock.calls stores a
-    // reference, not a snapshot -- index by known position, not `.at(-1)`, which would
-    // reflect the array's *final* state after the whole loop finishes.
-    const secondCallArgs = create.mock.calls[1]![0] as Anthropic.MessageCreateParamsNonStreaming;
-    const toolResultMessage = secondCallArgs.messages[2]!;
-    const content = toolResultMessage.content as Anthropic.ToolResultBlockParam[];
-    expect(content[0]!.is_error).toBe(true);
-    expect(String(content[0]!.content)).toMatch(/Denied by policy/);
+    // messages at second call: [system, user, assistant(tool_call), tool(denied_result)]
+    const secondCallArgs = create.mock.calls[1]![0] as OpenAI.ChatCompletionCreateParamsNonStreaming;
+    const toolResultMessage = secondCallArgs.messages[3]!;
+    expect(String(toolResultMessage.content)).toMatch(/Denied by policy/);
   });
 
   it("halts once the turn ceiling is exceeded, without calling finish_task", async () => {
-    const create = vi.fn().mockResolvedValue(makeMessage([toolUseBlock("toolu_1", "shell__exec", { command: "ls" })]));
+    const create = vi.fn().mockResolvedValue(makeCompletion(null, [toolCall("tc_1", "shell__exec", { command: "ls" })]));
 
     const result = await runAgentLoop(
       baseOptions({
-        anthropicClient: { messages: { create } } as unknown as MessagesClient,
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
         maxTurns: 1,
       }),
     );
@@ -145,12 +138,13 @@ describe("runAgentLoop", () => {
   });
 
   it("halts once the cost ceiling is exceeded", async () => {
-    const create = vi.fn().mockResolvedValue(makeMessage([toolUseBlock("toolu_1", "shell__exec", { command: "ls" })]));
+    const create = vi.fn().mockResolvedValue(makeCompletion(null, [toolCall("tc_1", "shell__exec", { command: "ls" })]));
 
+    // 100 input * $3/M + 50 output * $15/M = $0.00105 per call, ceiling $0.001
     const result = await runAgentLoop(
       baseOptions({
-        anthropicClient: { messages: { create } } as unknown as MessagesClient,
-        maxCostUsd: 0, // first response already costs > $0, so the second iteration must halt
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
+        maxCostUsd: 0.001,
         maxTurns: 10,
       }),
     );
@@ -160,20 +154,21 @@ describe("runAgentLoop", () => {
   });
 
   it("nudges a model that responds with no tool call, and eventually halts if it never recovers", async () => {
-    const create = vi.fn().mockResolvedValue(makeMessage([textBlock("thinking out loud, no action")]));
+    const create = vi.fn().mockResolvedValue(makeCompletion("thinking out loud, no action", []));
 
     const result = await runAgentLoop(
       baseOptions({
-        anthropicClient: { messages: { create } } as unknown as MessagesClient,
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
         maxTurns: 2,
       }),
     );
 
     expect(result.status).toBe("halted");
-    // first call: text-only -> nudge. Second call: text-only again -> nudges (2) + iter (2) > maxTurns (2) -> halt.
     expect(create).toHaveBeenCalledTimes(2);
-    const secondCallArgs = create.mock.calls[1]![0] as Anthropic.MessageCreateParamsNonStreaming;
-    const nudgeMessage = secondCallArgs.messages[2]!; // index by position -- see note in the test above
+
+    // messages at second call: [system, user, assistant(text-only), user(nudge)]
+    const secondCallArgs = create.mock.calls[1]![0] as OpenAI.ChatCompletionCreateParamsNonStreaming;
+    const nudgeMessage = secondCallArgs.messages[3]!;
     expect(String(nudgeMessage.content)).toMatch(/Continue the task, or call finish_task/);
   });
 });

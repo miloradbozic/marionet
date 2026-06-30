@@ -162,6 +162,47 @@ server.registerTool(
 );
 
 server.registerTool(
+  "browser__eval",
+  {
+    description: "Execute a JavaScript expression in the current page context and return the result as JSON. Use this to click elements that can't be targeted by CSS selector (e.g. buttons found by text content).",
+    inputSchema: { expression: z.string().describe("JavaScript expression to evaluate in the page") },
+  },
+  async ({ expression }) => {
+    try {
+      const p = await getPage();
+      const result = await p.evaluate(expression);
+      return { content: [{ type: "text" as const, text: result === undefined ? "OK (void return)" : JSON.stringify(result) }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__wait_for",
+  {
+    description: "Wait for a CSS selector to appear on the page (up to 30s), or wait a fixed number of milliseconds. Use after navigation on SPAs to wait for React to finish rendering before interacting.",
+    inputSchema: {
+      selector: z.string().optional().describe("CSS selector to wait for"),
+      ms: z.number().optional().describe("Fixed wait in milliseconds (used if no selector given)"),
+    },
+  },
+  async ({ selector, ms }) => {
+    try {
+      const p = await getPage();
+      if (selector) {
+        await p.waitForSelector(selector, { timeout: 30_000 });
+        return { content: [{ type: "text" as const, text: `Element appeared: ${selector}` }] };
+      }
+      await p.waitForTimeout(ms ?? 2000);
+      return { content: [{ type: "text" as const, text: `Waited ${ms ?? 2000}ms` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
   "browser__select",
   {
     description: "Select an option in a <select> dropdown by its visible label or value.",

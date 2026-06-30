@@ -1,18 +1,49 @@
 import path from "node:path";
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { loadRunConfig } from "./mcp/server-registry.js";
 import { McpClientManager } from "./mcp/mcp-client-manager.js";
 import { PolicyEngine } from "./policy/policy-engine.js";
 import { RunLogger } from "./logging/run-logger.js";
 import { renderTranscript } from "./logging/transcript-renderer.js";
 import { runAgentLoop } from "./loop/agent-loop.js";
-import { createAnthropicClient } from "./anthropic-client.js";
+import { createLlmClient } from "./llm-client.js";
+
+async function isCdpReachable(cdpEndpoint: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${cdpEndpoint}/json/version`);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function ensureChrome(cdpEndpoint: string): Promise<void> {
+  if (await isCdpReachable(cdpEndpoint)) return;
+
+  console.log("Chrome not detected — starting Chrome...");
+  const child = spawn(
+    "google-chrome",
+    ["--remote-debugging-port=9222", "--user-data-dir=/tmp/marionet-chrome"],
+    { detached: true, stdio: "ignore" },
+  );
+  child.unref();
+
+  // Poll until CDP responds (up to 10s)
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (await isCdpReachable(cdpEndpoint)) return;
+  }
+  throw new Error(`Chrome did not become reachable at ${cdpEndpoint} after 10s`);
+}
 
 const USAGE = 'Usage: marionet run "<task>"\n       marionet transcript [run-id]';
 
 async function runCommand(repoRoot: string, task: string): Promise<void> {
   const runConfig = loadRunConfig(path.join(repoRoot, "config", "run.config.json"));
   const policy = new PolicyEngine(path.join(repoRoot, "config", "policy.json5"));
+
+  await ensureChrome(runConfig.browser.cdpEndpoint);
 
   mkdirSync(path.join(repoRoot, "runs"), { recursive: true });
   mkdirSync(path.join(repoRoot, "workspace"), { recursive: true });
@@ -35,15 +66,19 @@ async function runCommand(repoRoot: string, task: string): Promise<void> {
     runConfig.browser.cdpEndpoint,
   );
 
+  const { client: llmClient, effectiveModel } = createLlmClient(runConfig.model);
+
   let exitCode = 1;
   try {
     const result = await runAgentLoop({
       task,
-      model: runConfig.model,
+      model: effectiveModel,
       maxTokens: runConfig.maxTokens,
       maxTurns: runConfig.maxTurns,
       maxCostUsd: runConfig.maxCostUsd,
-      anthropicClient: createAnthropicClient(),
+      supportsVision: runConfig.supportsVision ?? true,
+      llmClient,
+      pricing: runConfig.pricing,
       mcpClientManager,
       policy,
       logger,
@@ -58,6 +93,8 @@ async function runCommand(repoRoot: string, task: string): Promise<void> {
     console.log(`\nlog: ${logger.runDir}`);
 
     exitCode = result.status === "success" ? 0 : 1;
+  } catch (err) {
+    console.error("fatal error:", err);
   } finally {
     await mcpClientManager.closeAll();
     process.exit(exitCode);

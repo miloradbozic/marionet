@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type Anthropic from "@anthropic-ai/sdk";
+import type OpenAI from "openai";
 import type { McpServerConfig } from "./server-registry.js";
 
 export interface McpContentBlock {
@@ -24,7 +24,7 @@ export interface McpToolResult {
 export class McpClientManager {
   private readonly clients: Client[] = [];
   private readonly toolOwner = new Map<string, Client>();
-  readonly anthropicTools: Anthropic.Tool[] = [];
+  readonly tools: OpenAI.ChatCompletionTool[] = [];
 
   static async connectAll(servers: McpServerConfig[], cwd: string, browserCdpEndpoint: string): Promise<McpClientManager> {
     const manager = new McpClientManager();
@@ -42,10 +42,13 @@ export class McpClientManager {
       const { tools } = await client.listTools();
       for (const tool of tools) {
         manager.toolOwner.set(tool.name, client);
-        manager.anthropicTools.push({
-          name: tool.name,
-          description: tool.description ?? "",
-          input_schema: tool.inputSchema as Anthropic.Tool.InputSchema,
+        manager.tools.push({
+          type: "function",
+          function: {
+            name: tool.name,
+            description: tool.description ?? "",
+            parameters: tool.inputSchema as Record<string, unknown>,
+          },
         });
       }
     }

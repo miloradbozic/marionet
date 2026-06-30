@@ -11,6 +11,8 @@ export interface RunConfig {
   maxTokens: number;
   maxTurns: number;
   maxCostUsd: number;
+  pricing?: { input: number; output: number };
+  supportsVision?: boolean;
   browser: { cdpEndpoint: string };
   mcpServers: McpServerConfig[];
 }

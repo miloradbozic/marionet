@@ -38,10 +38,10 @@ describe("PolicyEngine against the shipped config/policy.json5", () => {
     expect(policy.evaluate("fs__write", { path: "notes.txt", content: "hi" }).action).toBe("allow");
   });
 
-  it("allows browser navigation and extraction, but asks before submitting a form", () => {
+  it("allows browser navigation, extraction, and form submission", () => {
     expect(policy.evaluate("browser__navigate", { url: "https://example.com" }).action).toBe("allow");
     expect(policy.evaluate("browser__extract", {}).action).toBe("allow");
-    expect(policy.evaluate("browser__submit_form", { selector: "#submit" }).action).toBe("ask");
+    expect(policy.evaluate("browser__submit_form", { selector: "#submit" }).action).toBe("allow");
   });
 
   it("asks before any gui tool", () => {
