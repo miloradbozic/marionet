@@ -307,7 +307,13 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       // the tool result with an explicit course-correction so it stops burning
       // turns on a doomed action (see the Akeneo search loop, run deesdu).
       if (isError && typeof content === "string") {
-        const signature = `${name}:${tc.function.arguments}`;
+        // Normalize out volatile "how long to wait" knobs so a model that just
+        // keeps bumping timeoutMs (or re-waiting) still counts as the same
+        // failing action and trips the guard.
+        const sigArgs: Record<string, unknown> = { ...args };
+        delete sigArgs.timeoutMs;
+        delete sigArgs.ms;
+        const signature = `${name}:${JSON.stringify(sigArgs)}`;
         const count = (failureCounts.get(signature) ?? 0) + 1;
         failureCounts.set(signature, count);
         if (count >= REPEAT_FAILURE_LIMIT) {

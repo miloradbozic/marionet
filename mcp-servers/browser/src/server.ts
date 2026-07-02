@@ -297,18 +297,18 @@ server.registerTool(
 server.registerTool(
   "browser__wait_for",
   {
-    description: "Wait for a CSS selector to appear on the page (default 8s), or wait a fixed number of milliseconds. Use after navigation on SPAs to wait for React to finish rendering before interacting. If a selector has not appeared within ~8s it is almost always the WRONG selector, not a slow one -- take a browser__snapshot to find the real element rather than raising the timeout or re-waiting.",
+    description: "Wait for a CSS selector to appear on the page (default 8s, hard-capped at 12s), or wait a fixed number of milliseconds. Use after navigation on SPAs to wait for React to finish rendering before interacting. If a selector has not appeared within ~8s it is almost always the WRONG selector, not a slow one -- take a browser__snapshot to find the real element. Do NOT keep raising timeoutMs and re-waiting; the cap will not let you wait longer, and a missing element will still be missing.",
     inputSchema: {
       selector: z.string().optional().describe("CSS selector to wait for"),
       ms: z.number().optional().describe("Fixed wait in milliseconds (used if no selector given)"),
-      timeoutMs: z.number().optional().describe("How long to wait for the selector before giving up (default 8000)"),
+      timeoutMs: z.number().optional().describe("How long to wait for the selector, default 8000, capped at 12000"),
     },
   },
   async ({ selector, ms, timeoutMs }) => {
     try {
       const p = await getPage();
       if (selector) {
-        await p.waitForSelector(selector, { timeout: timeoutMs ?? 8_000 });
+        await p.waitForSelector(selector, { timeout: Math.min(timeoutMs ?? 8_000, 12_000) });
         return { content: [{ type: "text" as const, text: `Element appeared: ${selector}` }] };
       }
       await p.waitForTimeout(ms ?? 2000);
