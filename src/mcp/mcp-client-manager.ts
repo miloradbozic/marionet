@@ -26,14 +26,24 @@ export class McpClientManager {
   private readonly toolOwner = new Map<string, Client>();
   readonly tools: OpenAI.ChatCompletionTool[] = [];
 
-  static async connectAll(servers: McpServerConfig[], cwd: string, browserCdpEndpoint: string): Promise<McpClientManager> {
+  static async connectAll(
+    servers: McpServerConfig[],
+    cwd: string,
+    browserCdpEndpoint: string,
+    /** Pre-filtered env (see filterEnvForClient); defaults to the full process env. */
+    env?: Record<string, string>,
+  ): Promise<McpClientManager> {
     const manager = new McpClientManager();
     for (const serverConfig of servers) {
       const transport = new StdioClientTransport({
         command: serverConfig.command,
         args: serverConfig.args,
         cwd,
-        env: { ...process.env, ...getDefaultEnvironment(), MARIONET_BROWSER_CDP_ENDPOINT: browserCdpEndpoint },
+        env: {
+          ...(env ?? (process.env as Record<string, string>)),
+          ...getDefaultEnvironment(),
+          MARIONET_BROWSER_CDP_ENDPOINT: browserCdpEndpoint,
+        },
       });
       const client = new Client({ name: "marionet-orchestrator", version: "0.1.0" });
       await client.connect(transport);

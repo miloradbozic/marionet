@@ -1,0 +1,5 @@
+{
+  "description": "Example client profile. Copy this directory to clients/<name>/ to onboard a client. Only scaffolding goes here -- playbooks/ and skills/ are written by marionet itself from successful exploration runs.",
+  "envPrefix": "EXAMPLE_",
+  "envAllowlist": ["LEGACY_UNPREFIXED_VAR"]
+}

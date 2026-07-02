@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-npm run marionet -- run "<task>"   # run the agent
+npm run marionet -- run "<task>"                 # run the agent (default profile: full env, no playbooks)
+npm run marionet -- run --client opari "<task>"  # client run: their playbooks injected, env filtered to their vars
 npm run marionet -- transcript     # render latest run to markdown (useful if run was killed)
 npm run marionet -- transcript <run-id>
 

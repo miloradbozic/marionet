@@ -23,8 +23,8 @@ Browser perception — how to find elements:
 - CSS-selector tools (browser__click, browser__fill, browser__wait_for) remain available for selectors you know from a playbook or cache; prefer refs for anything discovered fresh.
 
 Efficiency rules — these are hard constraints, not suggestions:
-- At the start of any browser task, read the site playbook first: Akeneo (any akeneo URL) → fs__read sites/akeneo.md. The playbook contains the real site URL and cached selectors. When the playbook covers a step you are about to take, follow it exactly without any extra inspection or extraction first.
-- After reading the playbook, call browser__cache_read using the ACTUAL site URL from the playbook or task (e.g. https://test-opari.cloud.akeneo.com -- never use example.com or placeholder URLs). If it returns cached data, use those selectors IMMEDIATELY and DIRECTLY -- do not call browser__extract or any other tool to "verify" or "explore" first. Skip all discovery entirely. After a flow succeeds, call browser__cache_write with only the keys the next run can use directly (flat object, no prose).
+- If playbooks are provided in the client context below (or the task points at one), follow them exactly when they cover a step you are about to take, without any extra inspection or extraction first. Playbooks contain the real site URLs and known-working selectors.
+- At the start of a browser flow, call browser__cache_read using the ACTUAL site URL from the playbook or task (never a placeholder URL). If it returns cached data, use those selectors IMMEDIATELY and DIRECTLY -- do not call browser__extract or any other tool to "verify" or "explore" first. Skip all discovery entirely. After a flow succeeds, call browser__cache_write with only the keys the next run can use directly (flat object, no prose).
 - Do NOT extract page state mid-flow to confirm a click or fill succeeded. Trust tool calls unless they return an error. Bad pattern: navigate → extract → click → extract → fill → extract. Good pattern: navigate → click → fill → save → finish_task (with verification). Only extract when you need data to decide the NEXT action.
 - After executing a save (JS click or browser__submit_form), call finish_task immediately with a verification that re-reads the saved state deterministically (e.g. browser__eval on the input's .value). Do not check success toasts -- they disappear in seconds and are unreliable.
 - NEVER use browser__extract with format "html" and selector "body" or no selector. This is banned -- it costs 10x tokens for near-zero value. HTML extracts must always use a specific, narrow selector. Use text format for reading content.
@@ -50,6 +50,8 @@ export interface AgentLoopOptions {
   maxCostUsd: number;
   pricing?: { input: number; output: number };
   supportsVision?: boolean;
+  /** Rendered client context (identity + playbooks), appended to the system prompt. */
+  clientPromptSection?: string;
   llmClient: LlmMessagesClient;
   mcpClientManager: McpClientManager;
   policy: PolicyEngine;
@@ -131,8 +133,9 @@ async function runFinishVerification(input: FinishTaskInput, opts: AgentLoopOpti
 }
 
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
+  const systemPrompt = opts.clientPromptSection ? `${SYSTEM_PROMPT}\n${opts.clientPromptSection}` : SYSTEM_PROMPT;
   const messages: OpenAI.ChatCompletionMessageParam[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt },
     { role: "user", content: opts.task },
   ];
   const tools: OpenAI.ChatCompletionTool[] = [...opts.mcpClientManager.tools, FINISH_TASK_TOOL];

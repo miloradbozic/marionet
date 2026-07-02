@@ -8,6 +8,12 @@ import { RunLogger } from "./logging/run-logger.js";
 import { renderTranscript } from "./logging/transcript-renderer.js";
 import { runAgentLoop } from "./loop/agent-loop.js";
 import { createLlmClient } from "./llm-client.js";
+import {
+  filterEnvForClient,
+  loadClientProfile,
+  renderClientPromptSection,
+  type ClientProfile,
+} from "./clients/client-profile.js";
 
 async function isCdpReachable(cdpEndpoint: string): Promise<boolean> {
   try {
@@ -37,11 +43,12 @@ async function ensureChrome(cdpEndpoint: string): Promise<void> {
   throw new Error(`Chrome did not become reachable at ${cdpEndpoint} after 10s`);
 }
 
-const USAGE = 'Usage: marionet run "<task>"\n       marionet transcript [run-id]';
+const USAGE = 'Usage: marionet run [--client <name>] "<task>"\n       marionet transcript [run-id]';
 
-async function runCommand(repoRoot: string, task: string): Promise<void> {
+async function runCommand(repoRoot: string, task: string, clientName: string | undefined): Promise<void> {
   const runConfig = loadRunConfig(path.join(repoRoot, "config", "run.config.json"));
-  const policy = new PolicyEngine(path.join(repoRoot, "config", "policy.json5"));
+  const profile: ClientProfile | undefined = clientName ? loadClientProfile(repoRoot, clientName) : undefined;
+  const policy = new PolicyEngine(path.join(repoRoot, "config", "policy.json5"), profile?.policyPath);
 
   await ensureChrome(runConfig.browser.cdpEndpoint);
 
@@ -50,6 +57,7 @@ async function runCommand(repoRoot: string, task: string): Promise<void> {
 
   const logger = new RunLogger(path.join(repoRoot, "runs"), {
     task,
+    client: profile?.name,
     model: runConfig.model,
     maxTurns: runConfig.maxTurns,
     maxCostUsd: runConfig.maxCostUsd,
@@ -58,12 +66,14 @@ async function runCommand(repoRoot: string, task: string): Promise<void> {
   });
 
   console.log(`marionet run ${logger.runId}`);
+  if (profile) console.log(`client: ${profile.name} (${profile.playbooks.length} playbook(s))`);
   console.log(`task: ${task}`);
 
   const mcpClientManager = await McpClientManager.connectAll(
     runConfig.mcpServers,
     repoRoot,
     runConfig.browser.cdpEndpoint,
+    filterEnvForClient(process.env, profile),
   );
 
   const { client: llmClient, effectiveModel } = createLlmClient(runConfig.model);
@@ -77,6 +87,7 @@ async function runCommand(repoRoot: string, task: string): Promise<void> {
       maxTurns: runConfig.maxTurns,
       maxCostUsd: runConfig.maxCostUsd,
       supportsVision: runConfig.supportsVision ?? true,
+      clientPromptSection: profile ? renderClientPromptSection(profile) : undefined,
       llmClient,
       pricing: runConfig.pricing,
       mcpClientManager,
@@ -138,13 +149,35 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (command !== "run" || !rest[0]) {
+  if (command !== "run") {
     console.error(USAGE);
     process.exitCode = 1;
     return;
   }
 
-  await runCommand(repoRoot, rest[0]);
+  let clientName: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    if (rest[i] === "--client") {
+      clientName = rest[++i];
+      if (!clientName) {
+        console.error("--client requires a name");
+        process.exitCode = 1;
+        return;
+      }
+    } else {
+      positional.push(rest[i]!);
+    }
+  }
+
+  const task = positional.join(" ").trim();
+  if (!task) {
+    console.error(USAGE);
+    process.exitCode = 1;
+    return;
+  }
+
+  await runCommand(repoRoot, task, clientName);
 }
 
 main().catch((err) => {
