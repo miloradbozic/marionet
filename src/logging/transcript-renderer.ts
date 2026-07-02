@@ -69,6 +69,9 @@ export function renderTranscript(runDir: string): string {
       case "nudge":
         parts.push(`  - (nudge: model produced no tool call)`);
         break;
+      case "loop_guard":
+        parts.push(`  - (loop guard: ${event.tool as string} failed ${event.count as number}x with identical args -- escalated)`);
+        break;
       default:
         break;
     }

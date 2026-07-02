@@ -5,6 +5,7 @@ import type { PolicyConfig } from "../policy/policy.types.js";
 export interface RunMeta {
   runId: string;
   task: string;
+  client?: string;
   model: string;
   maxTurns: number;
   maxCostUsd: number;
@@ -34,6 +35,7 @@ export class RunLogger {
     runsRoot: string,
     opts: {
       task: string;
+      client?: string;
       model: string;
       maxTurns: number;
       maxCostUsd: number;
@@ -51,6 +53,7 @@ export class RunLogger {
     this.meta = {
       runId: this.runId,
       task: opts.task,
+      ...(opts.client ? { client: opts.client } : {}),
       model: opts.model,
       maxTurns: opts.maxTurns,
       maxCostUsd: opts.maxCostUsd,

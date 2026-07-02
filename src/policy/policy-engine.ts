@@ -13,16 +13,24 @@ const FAIL_CLOSED_RULE: PolicyRule = { match: "*", action: "deny" };
  * Loads config/policy.json5 once at construction time and snapshots it, so a
  * run's gating decisions stay explicable later even if the file is edited
  * mid-run or afterward (see logging design: meta.json stores this snapshot).
+ *
+ * An optional client policy (clients/<name>/policy.json5) is evaluated
+ * BEFORE the global rules -- first-match-wins, so a client profile can
+ * tighten or loosen specific tools for that client only. The snapshot
+ * contains the merged rule list actually used for the run.
  */
 export class PolicyEngine {
   private readonly rules: PolicyRule[];
   readonly sourcePath: string;
   readonly snapshot: PolicyConfig;
 
-  constructor(policyFilePath: string) {
-    this.sourcePath = policyFilePath;
-    const raw = readFileSync(policyFilePath, "utf-8");
-    this.snapshot = JSON5.parse(raw) as PolicyConfig;
+  constructor(policyFilePath: string, clientPolicyPath?: string) {
+    this.sourcePath = clientPolicyPath ? `${clientPolicyPath} + ${policyFilePath}` : policyFilePath;
+    const globalConfig = JSON5.parse(readFileSync(policyFilePath, "utf-8")) as PolicyConfig;
+    const clientRules = clientPolicyPath
+      ? (JSON5.parse(readFileSync(clientPolicyPath, "utf-8")) as PolicyConfig).rules
+      : [];
+    this.snapshot = { rules: [...clientRules, ...globalConfig.rules] };
     this.rules = this.snapshot.rules;
   }
 

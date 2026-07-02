@@ -6,3 +6,7 @@ dist/
 runs/
 workspace/
 *.tsbuildinfo
+
+# Client knowledge is client-specific; only the example template is committed.
+clients/*
+!clients/example/

@@ -13,6 +13,13 @@ import { buildSnapshot, renderSnapshot, refSelector, REF_MISS_HINT } from "./sna
 const CDP_ENDPOINT = process.env.MARIONET_BROWSER_CDP_ENDPOINT ?? "http://localhost:9222";
 const WORKSPACE_ROOT = path.resolve(process.cwd(), "workspace");
 
+// Timeout for a single element action (click/fill/press/select). With
+// auto-settle (see settle()) the page has stopped changing before we act, so
+// an element that still isn't actionable within this window almost always
+// means the WRONG selector, not a slow one -- fail fast and let the model
+// re-perceive rather than burning 15s per miss.
+const ACTION_TIMEOUT_MS = 6_000;
+
 let browser: Browser | undefined;
 let page: Page | undefined;
 const hookedContexts = new WeakSet<ReturnType<Browser["contexts"]>[number]>();
@@ -47,6 +54,43 @@ function errorResult(err: unknown) {
   return { content: [{ type: "text" as const, text: `Error: ${message}` }], isError: true };
 }
 
+// Human-like "wait for the page to stop changing" before returning control.
+// The #1 source of flakiness on SPAs is acting on a page that is still
+// re-rendering after the previous action (stale rows, unmounted fields, etc.).
+// A person instinctively waits a beat and looks; the model does not, so we
+// bake the beat into every mutating tool. We resolve once the DOM has been
+// quiet for `quietMs`, or after `maxMs` regardless -- adaptive, like a human:
+// near-instant on a static page, longer only while things are actually moving.
+// Passed as a raw string so esbuild/tsx's keepNames transform can't inject an
+// undefined `__name` helper into the page context (see snapshot.ts for the
+// same hazard).
+async function settle(page: Page, quietMs = 500, maxMs = 4000): Promise<void> {
+  try {
+    await page.evaluate(
+      `new Promise((resolve) => {
+        if (!document.body) { resolve(); return; }
+        var start = Date.now();
+        var timer;
+        var obs;
+        function done() { try { if (obs) obs.disconnect(); } catch (e) {} clearTimeout(timer); resolve(); }
+        function bump() {
+          clearTimeout(timer);
+          var remaining = ${maxMs} - (Date.now() - start);
+          timer = setTimeout(done, Math.min(${quietMs}, Math.max(0, remaining)));
+        }
+        try {
+          obs = new MutationObserver(bump);
+          obs.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+        } catch (e) {}
+        bump();
+        setTimeout(done, ${maxMs});
+      })`,
+    );
+  } catch {
+    // Context destroyed (navigation) or page closed mid-settle -- nothing to wait for.
+  }
+}
+
 const server = new McpServer({ name: "marionet-browser", version: "0.1.0" });
 
 server.registerTool(
@@ -59,6 +103,7 @@ server.registerTool(
     try {
       const p = await getPage();
       await p.goto(url, { waitUntil: "domcontentloaded" });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Navigated to ${p.url()} ("${await p.title()}")` }] };
     } catch (err) {
       return errorResult(err);
@@ -102,8 +147,66 @@ server.registerTool(
       if ((await p.locator(selector).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
-      await p.click(selector, { timeout: 15_000 });
+      await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Clicked ${ref}` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__click_text",
+  {
+    description:
+      "Click the element whose visible text matches `text` (substring by default, or exact). Use this to click a table row, list item, link, or button by what it SAYS -- e.g. open a grid row by its ID/SKU -- instead of hand-writing JS in browser__eval or guessing a CSS selector. If the match is inside a table row (<tr>) the whole row is clicked (data grids open on row click); otherwise the nearest <a>/<button> ancestor, else the matched element. Returns what was clicked and whether the page navigated -- a click that does not navigate when you expected an edit page means the row wasn't really opened. Returns an error if no element contains the text (for a search result, that means no such row -- confirm the empty state, don't retry forever).",
+    inputSchema: {
+      text: z.string().describe("Visible text to match, e.g. a product SKU or a link label"),
+      exact: z.boolean().optional().describe("Require the matched element's text to equal `text` exactly (default: substring match)"),
+    },
+  },
+  async ({ text, exact }) => {
+    try {
+      const p = await getPage();
+      const before = p.url();
+      // Raw string (not a function) so esbuild/tsx keepNames can't inject an
+      // undefined __name into the page (same hazard as snapshot.ts / settle).
+      const expr = `(() => {
+        var norm = function (s) { return (s || "").replace(/\\s+/g, " ").trim(); };
+        var t = norm(${JSON.stringify(text)});
+        var exact = ${exact ? "true" : "false"};
+        var all = Array.prototype.slice.call(document.querySelectorAll("body *"));
+        var matches = all.filter(function (el) {
+          var et = norm(el.textContent);
+          return exact ? et === t : et.indexOf(t) !== -1;
+        });
+        // Deepest (fewest descendants) match first: target the specific cell, not a wrapping container.
+        matches.sort(function (a, b) { return a.querySelectorAll("*").length - b.querySelectorAll("*").length; });
+        var hit = matches[0];
+        if (!hit) return null;
+        var target = hit.closest("tr") || hit.closest("a,button,[role=button],[role=link]") || hit;
+        try { target.scrollIntoView({ block: "center" }); } catch (e) {}
+        target.click();
+        return { tag: target.tagName, text: norm(target.textContent).slice(0, 80) };
+      })()`;
+      const clicked = (await p.evaluate(expr)) as { tag: string; text: string } | null;
+      if (!clicked) {
+        return {
+          content: [{ type: "text" as const, text: `No element found containing text "${text}".` }],
+          isError: true,
+        };
+      }
+      await settle(p);
+      const navigated = p.url() !== before;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Clicked ${clicked.tag} "${clicked.text}"` + (navigated ? ` — navigated to ${p.url()}` : " — page did not navigate"),
+          },
+        ],
+      };
     } catch (err) {
       return errorResult(err);
     }
@@ -127,7 +230,8 @@ server.registerTool(
       if ((await p.locator(selector).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
-      await p.fill(selector, value, { timeout: 15_000 });
+      await p.fill(selector, value, { timeout: ACTION_TIMEOUT_MS });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${ref} with "${value}"` }] };
     } catch (err) {
       return errorResult(err);
@@ -144,7 +248,8 @@ server.registerTool(
   async ({ selector }) => {
     try {
       const p = await getPage();
-      await p.click(selector, { timeout: 15_000 });
+      await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Clicked ${selector}` }] };
     } catch (err) {
       return errorResult(err);
@@ -211,8 +316,35 @@ server.registerTool(
   async ({ selector, value }) => {
     try {
       const p = await getPage();
-      await p.fill(selector, value, { timeout: 15_000 });
+      await p.fill(selector, value, { timeout: ACTION_TIMEOUT_MS });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${selector} with "${value}"` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__press",
+  {
+    description:
+      "Press a keyboard key, optionally after focusing a field. Use this to submit a search box or form that only reacts to Enter (browser__fill sets a value but sends no keystrokes, so debounced/keyboard-driven searches never fire). Key names follow Playwright: 'Enter', 'Escape', 'Tab', 'ArrowDown', etc. If selector is given the field is focused (clicked) first; otherwise the key goes to the currently focused element.",
+    inputSchema: {
+      key: z.string().describe("Key to press, e.g. 'Enter'"),
+      selector: z.string().optional().describe("CSS selector to focus before pressing (optional)"),
+    },
+  },
+  async ({ key, selector }) => {
+    try {
+      const p = await getPage();
+      if (selector) {
+        await p.press(selector, key, { timeout: ACTION_TIMEOUT_MS });
+      } else {
+        await p.keyboard.press(key);
+      }
+      await settle(p);
+      return { content: [{ type: "text" as const, text: `Pressed ${key}${selector ? ` on ${selector}` : ""}` }] };
     } catch (err) {
       return errorResult(err);
     }
@@ -244,7 +376,8 @@ server.registerTool(
       if (ref && (await p.locator(target).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
-      await p.fill(target, value, { timeout: 15_000 });
+      await p.fill(target, value, { timeout: ACTION_TIMEOUT_MS });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${ref ?? selector} from env var ${env_var}` }] };
     } catch (err) {
       return errorResult(err);
@@ -262,6 +395,7 @@ server.registerTool(
     try {
       const p = await getPage();
       const result = await p.evaluate(expression);
+      await settle(p);
       return { content: [{ type: "text" as const, text: result === undefined ? "OK (void return)" : JSON.stringify(result) }] };
     } catch (err) {
       return errorResult(err);
@@ -272,17 +406,18 @@ server.registerTool(
 server.registerTool(
   "browser__wait_for",
   {
-    description: "Wait for a CSS selector to appear on the page (up to 30s), or wait a fixed number of milliseconds. Use after navigation on SPAs to wait for React to finish rendering before interacting.",
+    description: "Wait for a CSS selector to appear on the page (default 8s, hard-capped at 12s), or wait a fixed number of milliseconds. Use after navigation on SPAs to wait for React to finish rendering before interacting. If a selector has not appeared within ~8s it is almost always the WRONG selector, not a slow one -- take a browser__snapshot to find the real element. Do NOT keep raising timeoutMs and re-waiting; the cap will not let you wait longer, and a missing element will still be missing.",
     inputSchema: {
       selector: z.string().optional().describe("CSS selector to wait for"),
       ms: z.number().optional().describe("Fixed wait in milliseconds (used if no selector given)"),
+      timeoutMs: z.number().optional().describe("How long to wait for the selector, default 8000, capped at 12000"),
     },
   },
-  async ({ selector, ms }) => {
+  async ({ selector, ms, timeoutMs }) => {
     try {
       const p = await getPage();
       if (selector) {
-        await p.waitForSelector(selector, { timeout: 30_000 });
+        await p.waitForSelector(selector, { timeout: Math.min(timeoutMs ?? 8_000, 12_000) });
         return { content: [{ type: "text" as const, text: `Element appeared: ${selector}` }] };
       }
       await p.waitForTimeout(ms ?? 2000);
@@ -302,9 +437,10 @@ server.registerTool(
   async ({ selector, option }) => {
     try {
       const p = await getPage();
-      await p.selectOption(selector, { label: option }, { timeout: 15_000 }).catch(
-        () => p.selectOption(selector, { value: option }, { timeout: 15_000 }),
+      await p.selectOption(selector, { label: option }, { timeout: ACTION_TIMEOUT_MS }).catch(
+        () => p.selectOption(selector, { value: option }, { timeout: ACTION_TIMEOUT_MS }),
       );
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Selected "${option}" in ${selector}` }] };
     } catch (err) {
       return errorResult(err);
@@ -340,10 +476,11 @@ server.registerTool(
       const submitLocator = p.locator(`${selector} [type=submit]`).first();
       const hasSubmitChild = await submitLocator.count() > 0;
       if (hasSubmitChild) {
-        await submitLocator.click({ timeout: 10_000 });
+        await submitLocator.click({ timeout: ACTION_TIMEOUT_MS });
       } else {
-        await p.click(selector, { timeout: 10_000 });
+        await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
       }
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Submitted form via ${selector}` }] };
     } catch (err) {
       return errorResult(err);

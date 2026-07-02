@@ -16,6 +16,8 @@ Finishing with status "success" requires a verification: a read-only tool call t
 
 Some tool calls pause for human confirmation; a denied call returns an error tool_result explaining why. If one is denied, adapt your approach rather than retrying the same call, or call finish_task with status "blocked".
 
+Recognize "not found" as a terminal answer, not an obstacle. If a search, lookup, or query returns an explicit empty state -- "0 results", "no products", "not found", "Sorry, there is nothing for your search", an empty list -- the thing you were told to act on very likely does not exist. Do NOT retry the same query, clear filters speculatively, or guess alternate URLs to conjure it into existence. Confirm the empty state once (read the result count or the empty-state message with browser__extract), then call finish_task with status "blocked" or "failure" and say plainly what was not found (e.g. "product 20345121 does not exist in this instance -- search returned 0 products"). A correct "it doesn't exist" finish is a success of the run; endless retrying is the failure.
+
 Browser perception — how to find elements:
 - Use browser__snapshot to see the page: it lists every visible interactive element with a ref (e1, e2, ...), role, name, and state. Act on refs with browser__click_ref / browser__fill_ref (and browser__fill_from_env with ref for secrets). Do NOT guess CSS selectors; snapshot first, then act.
 - Use the query argument to filter large pages (e.g. query "save" to find save buttons) and scope to limit to a region.
@@ -23,8 +25,8 @@ Browser perception — how to find elements:
 - CSS-selector tools (browser__click, browser__fill, browser__wait_for) remain available for selectors you know from a playbook or cache; prefer refs for anything discovered fresh.
 
 Efficiency rules — these are hard constraints, not suggestions:
-- At the start of any browser task, read the site playbook first: Akeneo (any akeneo URL) → fs__read sites/akeneo.md. The playbook contains the real site URL and cached selectors. When the playbook covers a step you are about to take, follow it exactly without any extra inspection or extraction first.
-- After reading the playbook, call browser__cache_read using the ACTUAL site URL from the playbook or task (e.g. https://test-opari.cloud.akeneo.com -- never use example.com or placeholder URLs). If it returns cached data, use those selectors IMMEDIATELY and DIRECTLY -- do not call browser__extract or any other tool to "verify" or "explore" first. Skip all discovery entirely. After a flow succeeds, call browser__cache_write with only the keys the next run can use directly (flat object, no prose).
+- If playbooks are provided in the client context below (or the task points at one), follow them exactly when they cover a step you are about to take, without any extra inspection or extraction first. Playbooks contain the real site URLs and known-working selectors.
+- At the start of a browser flow, call browser__cache_read using the ACTUAL site URL from the playbook or task (never a placeholder URL). If it returns cached data, use those selectors IMMEDIATELY and DIRECTLY -- do not call browser__extract or any other tool to "verify" or "explore" first. Skip all discovery entirely. After a flow succeeds, call browser__cache_write with only the keys the next run can use directly (flat object, no prose).
 - Do NOT extract page state mid-flow to confirm a click or fill succeeded. Trust tool calls unless they return an error. Bad pattern: navigate → extract → click → extract → fill → extract. Good pattern: navigate → click → fill → save → finish_task (with verification). Only extract when you need data to decide the NEXT action.
 - After executing a save (JS click or browser__submit_form), call finish_task immediately with a verification that re-reads the saved state deterministically (e.g. browser__eval on the input's .value). Do not check success toasts -- they disappear in seconds and are unreliable.
 - NEVER use browser__extract with format "html" and selector "body" or no selector. This is banned -- it costs 10x tokens for near-zero value. HTML extracts must always use a specific, narrow selector. Use text format for reading content.
@@ -32,6 +34,25 @@ Efficiency rules — these are hard constraints, not suggestions:
 - After navigating to a site, take a browser__snapshot FIRST to see the actual page state -- never browser__wait_for a login field to "check" if login is needed (a 30s timeout on an already-authenticated page is pure waste). If the snapshot shows a login form, log in; if it shows the app, proceed.
 - Batch independent tool calls in a single response (e.g. fill multiple fields at once, not one per turn).
 - Prefer clicking navigation elements over guessing URLs -- SPAs use hash or API-driven routing that is hard to predict.`;
+
+/** How many identical failing tool calls before the loop guard escalates. */
+const REPEAT_FAILURE_LIMIT = 3;
+
+/**
+ * Tool-call arguments arrive as a JSON string the model generated, so they can
+ * be malformed (unescaped quotes/newlines in a JS expression are the usual
+ * culprit). A single bad tool call must never crash the whole run -- parse
+ * defensively and turn a parse failure into a recoverable error for the model.
+ */
+function safeParseArgs(
+  raw: string,
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  try {
+    return { ok: true, value: (JSON.parse(raw) as Record<string, unknown>) ?? {} };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
 
 /** Minimal surface the loop needs -- lets tests inject a fake. */
 export interface LlmMessagesClient {
@@ -50,6 +71,8 @@ export interface AgentLoopOptions {
   maxCostUsd: number;
   pricing?: { input: number; output: number };
   supportsVision?: boolean;
+  /** Rendered client context (identity + playbooks), appended to the system prompt. */
+  clientPromptSection?: string;
   llmClient: LlmMessagesClient;
   mcpClientManager: McpClientManager;
   policy: PolicyEngine;
@@ -131,8 +154,9 @@ async function runFinishVerification(input: FinishTaskInput, opts: AgentLoopOpti
 }
 
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
+  const systemPrompt = opts.clientPromptSection ? `${SYSTEM_PROMPT}\n${opts.clientPromptSection}` : SYSTEM_PROMPT;
   const messages: OpenAI.ChatCompletionMessageParam[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt },
     { role: "user", content: opts.task },
   ];
   const tools: OpenAI.ChatCompletionTool[] = [...opts.mcpClientManager.tools, FINISH_TASK_TOOL];
@@ -140,6 +164,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   let totalCostUsd = 0;
   let iter = 0;
   let nudges = 0;
+  const failureCounts = new Map<string, number>();
 
   for (;;) {
     iter++;
@@ -181,11 +206,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       type: "model_response",
       stopReason: choice.finish_reason,
       text: text || undefined,
-      toolUses: toolCalls.map((tc) => ({
-        id: tc.id,
-        name: tc.function.name,
-        input: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-      })),
+      toolUses: toolCalls.map((tc) => {
+        const parsed = safeParseArgs(tc.function.arguments);
+        return {
+          id: tc.id,
+          name: tc.function.name,
+          input: parsed.ok ? parsed.value : { _unparsed: tc.function.arguments, _parseError: parsed.error },
+        };
+      }),
       usage: { input_tokens: inputTokens, output_tokens: outputTokens },
     });
 
@@ -210,7 +238,24 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 
     for (const tc of toolCalls) {
       const name = tc.function.name;
-      const args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+      const parsed = safeParseArgs(tc.function.arguments);
+      if (!parsed.ok) {
+        opts.logger.log({
+          type: "tool_result",
+          toolUseId: tc.id,
+          tool: name,
+          isError: true,
+          durationMs: 0,
+          content: [{ type: "text", text: `Invalid JSON arguments: ${parsed.error}` }],
+        });
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: `Your ${name} call arguments were not valid JSON (${parsed.error}). Re-send the call with correctly escaped JSON -- if a value contains quotes, newlines, or backslashes (e.g. a JS expression for browser__eval), escape them properly, or prefer a dedicated tool like browser__click_text so you don't have to hand-write JS.`,
+        });
+        continue;
+      }
+      const args = parsed.value;
 
       if (name === FINISH_TASK_TOOL_NAME) {
         const input = args as unknown as FinishTaskInput;
@@ -268,33 +313,54 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       }
 
       const start = Date.now();
+      let content: string;
+      let isError: boolean;
       try {
         const result = await opts.mcpClientManager.callTool(name, args);
+        isError = Boolean(result.isError);
         opts.logger.log({
           type: "tool_result",
           toolUseId: tc.id,
           tool: name,
-          isError: Boolean(result.isError),
+          isError,
           durationMs: Date.now() - start,
           content: result.content,
         });
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: mcpResultToToolContent(result, opts.supportsVision ?? true),
-        });
+        content = mcpResultToToolContent(result, opts.supportsVision ?? true);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        isError = true;
+        content = err instanceof Error ? err.message : String(err);
         opts.logger.log({
           type: "tool_result",
           toolUseId: tc.id,
           tool: name,
           isError: true,
           durationMs: Date.now() - start,
-          content: [{ type: "text", text: message }],
+          content: [{ type: "text", text: content }],
         });
-        messages.push({ role: "tool", tool_call_id: tc.id, content: message });
       }
+
+      // Loop guard: a model that keeps re-issuing the *same* failing call is
+      // stuck, not making progress. After a few identical failures, escalate
+      // the tool result with an explicit course-correction so it stops burning
+      // turns on a doomed action (see the Akeneo search loop, run deesdu).
+      if (isError && typeof content === "string") {
+        // Normalize out volatile "how long to wait" knobs so a model that just
+        // keeps bumping timeoutMs (or re-waiting) still counts as the same
+        // failing action and trips the guard.
+        const sigArgs: Record<string, unknown> = { ...args };
+        delete sigArgs.timeoutMs;
+        delete sigArgs.ms;
+        const signature = `${name}:${JSON.stringify(sigArgs)}`;
+        const count = (failureCounts.get(signature) ?? 0) + 1;
+        failureCounts.set(signature, count);
+        if (count >= REPEAT_FAILURE_LIMIT) {
+          opts.logger.log({ type: "loop_guard", tool: name, count });
+          content = `${content}\n\n[marionet] You have now called ${name} with these exact arguments ${count} times and it has failed every time. Stop repeating it. Do something different: take a browser__snapshot to find the real element, try a different tool or selector, or call finish_task with status "blocked" if you genuinely cannot proceed.`;
+        }
+      }
+
+      messages.push({ role: "tool", tool_call_id: tc.id, content });
     }
 
     if (finishResult) return finishResult;
