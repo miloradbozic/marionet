@@ -102,10 +102,18 @@ export async function compileRun(input: CompileInput): Promise<Skill> {
   const literals = detectLiterals(input.task, steps, postCondition);
   const naming = await input.namer({ task: input.task, steps, postCondition, literals });
 
-  const substituted = parameterize(steps, postCondition, naming.paramNames);
+  // The detected `literals` are the sole source of truth for what gets
+  // substituted; the namer only supplies display names. Building the map from
+  // `literals` (not from `naming.paramNames`) means an over-eager namer that
+  // returns extra/renamed keys can't inject unintended replacements into the
+  // args, and guarantees `params` and the substituted steps stay consistent.
+  const nameFor = (lit: string): string => naming.paramNames[lit] ?? lit;
+  const paramNames: Record<string, string> = Object.fromEntries(literals.map((lit) => [lit, nameFor(lit)]));
+
+  const substituted = parameterize(steps, postCondition, paramNames);
 
   const params: SkillParam[] = literals.map((lit) => ({
-    name: naming.paramNames[lit] ?? lit,
+    name: nameFor(lit),
     example: lit,
   }));
 

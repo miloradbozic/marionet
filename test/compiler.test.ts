@@ -87,6 +87,29 @@ describe("compileRun", () => {
     expect(skill.source.runId).toBe("test-run");
   });
 
+  it("ignores namer keys that are not detected literals (no arg corruption)", async () => {
+    // An over-eager namer returns an extra key ("akeneo") that appears in the
+    // navigate URLs but is NOT a detected literal. It must not be substituted.
+    const rogueNamer: Namer = async () => ({
+      skillName: "open_product_by_sku",
+      description: "…",
+      paramNames: { "901384900": "sku", "1234567890999": "ean", akeneo: "system" },
+    });
+    const skill = await compileRun({
+      events: fixtureEvents,
+      runId: "r",
+      task: TASK,
+      model: "m",
+      metaStatus: "success",
+      namer: rogueNamer,
+    });
+
+    const stepsJson = JSON.stringify(skill.steps);
+    expect(stepsJson).not.toContain("{{system}}");
+    expect(stepsJson).toContain("akeneo.com"); // URL left intact
+    expect(skill.params.map((p) => p.name).sort()).toEqual(["ean", "sku"]);
+  });
+
   it("refuses to compile a run that did not succeed", async () => {
     await expect(
       compileRun({ events: fixtureEvents, runId: "r", task: TASK, model: "m", metaStatus: "halted", namer: stubNamer }),
