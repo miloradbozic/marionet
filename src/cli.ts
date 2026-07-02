@@ -1,13 +1,15 @@
 import path from "node:path";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { loadRunConfig } from "./mcp/server-registry.js";
 import { McpClientManager } from "./mcp/mcp-client-manager.js";
 import { PolicyEngine } from "./policy/policy-engine.js";
-import { RunLogger } from "./logging/run-logger.js";
+import { RunLogger, type RunMeta } from "./logging/run-logger.js";
 import { renderTranscript } from "./logging/transcript-renderer.js";
 import { runAgentLoop } from "./loop/agent-loop.js";
 import { createLlmClient } from "./llm-client.js";
+import { compileRun, heuristicNamer, llmNamer, type Namer } from "./compiler/compile.js";
+import { parseEvents } from "./compiler/trajectory.js";
 import {
   filterEnvForClient,
   loadClientProfile,
@@ -43,7 +45,10 @@ async function ensureChrome(cdpEndpoint: string): Promise<void> {
   throw new Error(`Chrome did not become reachable at ${cdpEndpoint} after 10s`);
 }
 
-const USAGE = 'Usage: marionet run [--client <name>] "<task>"\n       marionet transcript [run-id]';
+const USAGE =
+  'Usage: marionet run [--client <name>] "<task>"\n' +
+  "       marionet transcript [run-id]\n" +
+  "       marionet compile [run-id] [--heuristic]";
 
 async function runCommand(repoRoot: string, task: string, clientName: string | undefined): Promise<void> {
   const runConfig = loadRunConfig(path.join(repoRoot, "config", "run.config.json"));
@@ -140,12 +145,58 @@ function transcriptCommand(repoRoot: string, runId: string | undefined): void {
   console.error(`\n(rendered from ${path.join(runDir, "events.jsonl")})`);
 }
 
+async function compileCommand(repoRoot: string, runId: string | undefined, useHeuristic: boolean): Promise<void> {
+  const runDir = resolveRunDir(repoRoot, runId);
+  const meta = JSON.parse(readFileSync(path.join(runDir, "meta.json"), "utf-8")) as RunMeta;
+  const events = parseEvents(readFileSync(path.join(runDir, "events.jsonl"), "utf-8"));
+
+  let namer: Namer = heuristicNamer;
+  if (!useHeuristic) {
+    try {
+      const runConfig = loadRunConfig(path.join(repoRoot, "config", "run.config.json"));
+      const { client, effectiveModel } = createLlmClient(runConfig.model);
+      namer = llmNamer(client, effectiveModel);
+    } catch (err) {
+      console.warn(`(no LLM available for naming: ${err instanceof Error ? err.message : String(err)}; using heuristic names)`);
+    }
+  }
+
+  const skill = await compileRun({
+    events,
+    runId: meta.runId,
+    task: meta.task,
+    model: meta.model,
+    client: meta.client,
+    metaStatus: meta.status,
+    namer,
+  });
+
+  const skillsDir = meta.client
+    ? path.join(repoRoot, "clients", meta.client, "skills")
+    : path.join(repoRoot, "workspace", "skills");
+  mkdirSync(skillsDir, { recursive: true });
+  const outPath = path.join(skillsDir, `${skill.name}.json`);
+  writeFileSync(outPath, JSON.stringify(skill, null, 2) + "\n");
+
+  console.log(`Compiled skill "${skill.name}" from run ${meta.runId}`);
+  console.log(`  params: ${skill.params.map((p) => `${p.name}=${p.example}`).join(", ") || "(none)"}`);
+  console.log(`  steps: ${skill.steps.length}, post-condition: ${skill.postCondition.tool}`);
+  console.log(`  -> ${outPath}`);
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   const repoRoot = process.cwd();
 
   if (command === "transcript") {
     transcriptCommand(repoRoot, rest[0]);
+    return;
+  }
+
+  if (command === "compile") {
+    const useHeuristic = rest.includes("--heuristic");
+    const runId = rest.find((a) => a !== "--heuristic");
+    await compileCommand(repoRoot, runId, useHeuristic);
     return;
   }
 
