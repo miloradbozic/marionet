@@ -9,6 +9,8 @@ npm run marionet -- run "<task>"                 # run the agent (default profil
 npm run marionet -- run --client opari "<task>"  # client run: their playbooks injected, env filtered to their vars
 npm run marionet -- transcript     # render latest run to markdown (useful if run was killed)
 npm run marionet -- transcript <run-id>
+npm run marionet -- compile [run-id]             # compile a successful+verified run into a reusable skill
+npm run marionet -- compile [run-id] --heuristic # ...skip the LLM naming call (offline positional names)
 
 npm run typecheck                  # type-check orchestrator + both MCP workspaces
 npm test                           # vitest unit tests (orchestrator only; no browser/shell)
@@ -64,6 +66,19 @@ Both servers are in `mcp-servers/` and are separate npm workspaces (`mcp-servers
 - `browser__click_text` — clicks the element whose visible text matches a string (substring or exact). If the match is inside a `<tr>` it clicks the whole row (data grids open on row click); else the nearest `<a>`/`<button>`; else the element. Reports whether the page navigated. Exists so the model stops hand-writing fragile `browser__eval` row-clicks (which repeatedly paraphrased into broken variants that no-oped and falsely reported success). Raw-string `page.evaluate` to dodge the esbuild `__name` hazard.
 
 **Auto-settle.** Every mutating browser tool (`navigate`, `click`, `click_ref`, `fill`, `fill_ref`, `fill_from_env`, `press`, `select`, `submit_form`, `eval`) calls `settle(page)` before returning: it resolves once the DOM has been quiet for ~500ms (or after a 4s cap). This bakes a human-like "wait for the page to stop changing, then look" beat into every action, so the model can't act on or perceive a half-rendered SPA (the root cause of stale-row / "0 results" misreads on Akeneo). It's adaptive — near-instant on a static page, longer only while the page is actually re-rendering. Implemented as a raw-string `page.evaluate` to dodge the same esbuild `__name` hazard documented in `snapshot.ts`.
+
+### Trajectory compiler (`src/compiler/`)
+
+Turns a successful, verified run into a reusable **skill** — the "learn once, replay cheap" half of the roadmap (Phase 4). `marionet compile <run-id>` reads that run's `events.jsonl` + `meta.json` and emits `clients/<client>/skills/<name>.json`.
+
+Pipeline (`compileRun` in `compile.ts`):
+1. `assertCompilable` — refuse unless `meta.status === "success"`, `finish_task` was `success`, and a `verification` event matched. A skill you can't trust is worse than none.
+2. `extractTrajectory` (`trajectory.ts`) — reduce events to the executed, non-errored tool calls (steps) and lift the passing verification into a `postCondition`. Drops a trailing step that merely re-reads the post-condition value (the model often double-checks before finishing).
+3. `detectLiterals` (`parameterize.ts`) — find task tokens that also appear in the step args, restricted to *value-like* literals (quoted strings, or tokens containing a digit). Prose words like `EAN`/`Akeneo` are deliberately skipped: they appear in a search-box value but not in the lowercased/snake_cased selector, so parameterizing them yields a half-substituted, broken skill.
+4. `namer` — names the skill and each param. `llmNamer` does one cheap JSON call (`open_product_by_sku`, `{sku, ean}`); `heuristicNamer` is the offline fallback (`--heuristic`, positional `param1…`).
+5. `parameterize` — replace every literal occurrence with `{{param}}` across steps + post-condition.
+
+Skills live under the client (gitignored, like other client data); the committed proof is `test/compiler.test.ts` running against the real `test/fixtures/akeneo-set-ean.events.jsonl`. Phase 5 (`feat/replay`) will execute these steps directly with zero LLM calls on the happy path.
 
 ### Logging (`runs/<run-id>/`)
 
