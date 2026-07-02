@@ -36,8 +36,14 @@ function toolCall(id: string, name: string, input: unknown): OpenAI.ChatCompleti
   return { id, type: "function", function: { name, arguments: JSON.stringify(input) } };
 }
 
-function finishTaskCompletion(status: "success" | "failure" | "blocked", summary: string): OpenAI.ChatCompletion {
-  return makeCompletion(null, [toolCall("tc_finish", "finish_task", { status, summary })]);
+const PASSING_VERIFICATION = { tool: "fs__read", args: { path: "out.txt" }, expectPattern: "ok" };
+
+function finishTaskCompletion(
+  status: "success" | "failure" | "blocked",
+  summary: string,
+  verification?: { tool: string; args: Record<string, unknown>; expectPattern: string },
+): OpenAI.ChatCompletion {
+  return makeCompletion(null, [toolCall("tc_finish", "finish_task", { status, summary, ...(verification ? { verification } : {}) })]);
 }
 
 function fakeLogger(): RunLogger {
@@ -71,21 +77,26 @@ function baseOptions(overrides: Partial<Parameters<typeof runAgentLoop>[0]> = {}
 }
 
 describe("runAgentLoop", () => {
-  it("ends the run as soon as finish_task is called", async () => {
-    const create = vi.fn().mockResolvedValue(finishTaskCompletion("success", "All done."));
+  it("ends the run when finish_task carries a passing verification", async () => {
+    const create = vi.fn().mockResolvedValue(finishTaskCompletion("success", "All done.", PASSING_VERIFICATION));
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
     const result = await runAgentLoop(
-      baseOptions({ llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient }),
+      baseOptions({
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
+        mcpClientManager: fakeMcpManager(callTool),
+      }),
     );
     expect(result).toEqual({ status: "success", summary: "All done.", details: undefined });
     expect(create).toHaveBeenCalledTimes(1);
+    expect(callTool).toHaveBeenCalledWith("fs__read", { path: "out.txt" });
   });
 
   it("routes an allowed tool call through the MCP manager, then finishes on the next turn", async () => {
     const create = vi
       .fn()
       .mockResolvedValueOnce(makeCompletion(null, [toolCall("tc_1", "shell__exec", { command: "ls" })]))
-      .mockResolvedValueOnce(finishTaskCompletion("success", "Listed files."));
-    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "file1\nfile2" }] });
+      .mockResolvedValueOnce(finishTaskCompletion("success", "Listed files.", PASSING_VERIFICATION));
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "file1\nfile2\nok" }] });
 
     const result = await runAgentLoop(
       baseOptions({
@@ -97,6 +108,71 @@ describe("runAgentLoop", () => {
     expect(callTool).toHaveBeenCalledWith("shell__exec", { command: "ls" });
     expect(result.status).toBe("success");
     expect(create).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a success finish that has no verification, and the run continues", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(finishTaskCompletion("success", "Done, trust me."))
+      .mockResolvedValueOnce(finishTaskCompletion("success", "Done, verified.", PASSING_VERIFICATION));
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+
+    const result = await runAgentLoop(
+      baseOptions({
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
+        mcpClientManager: fakeMcpManager(callTool),
+      }),
+    );
+
+    expect(result.status).toBe("success");
+    expect(create).toHaveBeenCalledTimes(2);
+
+    // messages at second call: [system, user, assistant(finish_task), tool(rejection)]
+    const secondCallArgs = create.mock.calls[1]![0] as OpenAI.ChatCompletionCreateParamsNonStreaming;
+    const rejection = secondCallArgs.messages[3]!;
+    expect(String(rejection.content)).toMatch(/requires a verification/);
+  });
+
+  it("rejects a success finish whose verification does not match, and accepts failure afterwards", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(
+        finishTaskCompletion("success", "Saved.", { tool: "browser__eval", args: { expression: "x" }, expectPattern: "expected-value" }),
+      )
+      .mockResolvedValueOnce(finishTaskCompletion("failure", "Save did not stick."));
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "something-else" }] });
+
+    const result = await runAgentLoop(
+      baseOptions({
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
+        mcpClientManager: fakeMcpManager(callTool),
+      }),
+    );
+
+    expect(result.status).toBe("failure");
+    // messages at second call: [system, user, assistant(finish_task), tool(rejection)]
+    const secondCallArgs = create.mock.calls[1]![0] as OpenAI.ChatCompletionCreateParamsNonStreaming;
+    const rejection = secondCallArgs.messages[3]!;
+    expect(String(rejection.content)).toMatch(/verification failed/);
+  });
+
+  it("does not execute a verification tool the policy denies", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(finishTaskCompletion("success", "Done.", PASSING_VERIFICATION))
+      .mockResolvedValueOnce(finishTaskCompletion("blocked", "Cannot verify."));
+    const callTool = vi.fn();
+
+    const result = await runAgentLoop(
+      baseOptions({
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
+        mcpClientManager: fakeMcpManager(callTool),
+        policy: fakePolicy("deny"),
+      }),
+    );
+
+    expect(callTool).not.toHaveBeenCalled();
+    expect(result.status).toBe("blocked");
   });
 
   it("never executes a tool the policy denies, and surfaces the denial as an error tool result", async () => {
