@@ -47,6 +47,43 @@ function errorResult(err: unknown) {
   return { content: [{ type: "text" as const, text: `Error: ${message}` }], isError: true };
 }
 
+// Human-like "wait for the page to stop changing" before returning control.
+// The #1 source of flakiness on SPAs is acting on a page that is still
+// re-rendering after the previous action (stale rows, unmounted fields, etc.).
+// A person instinctively waits a beat and looks; the model does not, so we
+// bake the beat into every mutating tool. We resolve once the DOM has been
+// quiet for `quietMs`, or after `maxMs` regardless -- adaptive, like a human:
+// near-instant on a static page, longer only while things are actually moving.
+// Passed as a raw string so esbuild/tsx's keepNames transform can't inject an
+// undefined `__name` helper into the page context (see snapshot.ts for the
+// same hazard).
+async function settle(page: Page, quietMs = 500, maxMs = 4000): Promise<void> {
+  try {
+    await page.evaluate(
+      `new Promise((resolve) => {
+        if (!document.body) { resolve(); return; }
+        var start = Date.now();
+        var timer;
+        var obs;
+        function done() { try { if (obs) obs.disconnect(); } catch (e) {} clearTimeout(timer); resolve(); }
+        function bump() {
+          clearTimeout(timer);
+          var remaining = ${maxMs} - (Date.now() - start);
+          timer = setTimeout(done, Math.min(${quietMs}, Math.max(0, remaining)));
+        }
+        try {
+          obs = new MutationObserver(bump);
+          obs.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+        } catch (e) {}
+        bump();
+        setTimeout(done, ${maxMs});
+      })`,
+    );
+  } catch {
+    // Context destroyed (navigation) or page closed mid-settle -- nothing to wait for.
+  }
+}
+
 const server = new McpServer({ name: "marionet-browser", version: "0.1.0" });
 
 server.registerTool(
@@ -59,6 +96,7 @@ server.registerTool(
     try {
       const p = await getPage();
       await p.goto(url, { waitUntil: "domcontentloaded" });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Navigated to ${p.url()} ("${await p.title()}")` }] };
     } catch (err) {
       return errorResult(err);
@@ -103,6 +141,7 @@ server.registerTool(
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
       await p.click(selector, { timeout: 15_000 });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Clicked ${ref}` }] };
     } catch (err) {
       return errorResult(err);
@@ -128,6 +167,7 @@ server.registerTool(
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
       await p.fill(selector, value, { timeout: 15_000 });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${ref} with "${value}"` }] };
     } catch (err) {
       return errorResult(err);
@@ -145,6 +185,7 @@ server.registerTool(
     try {
       const p = await getPage();
       await p.click(selector, { timeout: 15_000 });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Clicked ${selector}` }] };
     } catch (err) {
       return errorResult(err);
@@ -212,6 +253,7 @@ server.registerTool(
     try {
       const p = await getPage();
       await p.fill(selector, value, { timeout: 15_000 });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${selector} with "${value}"` }] };
     } catch (err) {
       return errorResult(err);
@@ -237,6 +279,7 @@ server.registerTool(
       } else {
         await p.keyboard.press(key);
       }
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Pressed ${key}${selector ? ` on ${selector}` : ""}` }] };
     } catch (err) {
       return errorResult(err);
@@ -270,6 +313,7 @@ server.registerTool(
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
       await p.fill(target, value, { timeout: 15_000 });
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${ref ?? selector} from env var ${env_var}` }] };
     } catch (err) {
       return errorResult(err);
@@ -287,6 +331,7 @@ server.registerTool(
     try {
       const p = await getPage();
       const result = await p.evaluate(expression);
+      await settle(p);
       return { content: [{ type: "text" as const, text: result === undefined ? "OK (void return)" : JSON.stringify(result) }] };
     } catch (err) {
       return errorResult(err);
@@ -331,6 +376,7 @@ server.registerTool(
       await p.selectOption(selector, { label: option }, { timeout: 15_000 }).catch(
         () => p.selectOption(selector, { value: option }, { timeout: 15_000 }),
       );
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Selected "${option}" in ${selector}` }] };
     } catch (err) {
       return errorResult(err);
@@ -370,6 +416,7 @@ server.registerTool(
       } else {
         await p.click(selector, { timeout: 10_000 });
       }
+      await settle(p);
       return { content: [{ type: "text" as const, text: `Submitted form via ${selector}` }] };
     } catch (err) {
       return errorResult(err);

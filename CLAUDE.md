@@ -61,6 +61,8 @@ Both servers are in `mcp-servers/` and are separate npm workspaces (`mcp-servers
 - `browser__submit_form` — finds `[type=submit]` within the given selector and clicks it. Works for standard HTML forms; does **not** work for JS-driven forms with no native submit button, or submit buttons outside the `<form>` tag (use `browser__click` directly in those cases). If broadening: consider an explicit `submitSelector` param.
 - `browser__press` — presses a keyboard key (e.g. `Enter`), optionally after focusing a selector. Needed because `browser__fill` sets a value and fires only an `input` event — it sends no keystrokes, so debounced or Enter-to-submit search boxes (e.g. the Akeneo product grid) never fire on fill alone.
 
+**Auto-settle.** Every mutating browser tool (`navigate`, `click`, `click_ref`, `fill`, `fill_ref`, `fill_from_env`, `press`, `select`, `submit_form`, `eval`) calls `settle(page)` before returning: it resolves once the DOM has been quiet for ~500ms (or after a 4s cap). This bakes a human-like "wait for the page to stop changing, then look" beat into every action, so the model can't act on or perceive a half-rendered SPA (the root cause of stale-row / "0 results" misreads on Akeneo). It's adaptive — near-instant on a static page, longer only while the page is actually re-rendering. Implemented as a raw-string `page.evaluate` to dodge the same esbuild `__name` hazard documented in `snapshot.ts`.
+
 ### Logging (`runs/<run-id>/`)
 
 - `events.jsonl` — append-only source of truth; survives crashes
