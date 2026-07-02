@@ -1,10 +1,10 @@
 {
-  "model": "openrouter/qwen/qwen3-235b-a22b",
+  "model": "openrouter/qwen/qwen3-vl-235b-a22b-instruct",
   "maxTokens": 4096,
   "maxTurns": 40,
-  "maxCostUsd": 0.05,
-  "supportsVision": false,
-  "pricing": { "input": 0.22, "output": 0.88 },
+  "maxCostUsd": 0.15,
+  "supportsVision": true,
+  "pricing": { "input": 0.20, "output": 0.88 },
   "browser": {
     "cdpEndpoint": "http://localhost:9222"
   },
