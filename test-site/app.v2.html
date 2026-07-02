@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Demo PIM</title>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 2rem auto; }
+    table { border-collapse: collapse; }
+    td { padding: 4px 12px; border: 1px solid #ccc; cursor: pointer; }
+    .sc-zzz999 { padding: 6px 12px; } /* the "redeploy": class renamed */
+  </style>
+</head>
+<body>
+  <!-- The mutated deploy for the golden-loop self-heal test: same app, but the
+       save button's CSS class, id, AND visible text all changed -- the
+       recorded selector and the recorded accessible name both miss, forcing a
+       heal. Everything else (grid, EAN field) is unchanged. -->
+  <div id="app"></div>
+  <script>
+    var PRODUCTS = {
+      "1001": { name: "Alpha Widget", ean: "" },
+      "2002": { name: "Beta Gadget", ean: "" },
+      "3003": { name: "Gamma Gizmo", ean: "" }
+    };
+    var filter = "";
+
+    function gridHtml() {
+      var rows = Object.keys(PRODUCTS).filter(function (sku) {
+        return !filter || sku.indexOf(filter) !== -1 || PRODUCTS[sku].name.indexOf(filter) !== -1;
+      });
+      return "<h1>Products</h1>" +
+        '<input id="grid-search" type="search" placeholder="Search products" value="' + filter + '" />' +
+        "<table><tbody>" + rows.map(function (sku) {
+          return '<tr data-sku="' + sku + '"><td>' + sku + "</td><td>" + PRODUCTS[sku].name + "</td></tr>";
+        }).join("") + "</tbody></table>";
+    }
+
+    function detailHtml(sku) {
+      var p = PRODUCTS[sku];
+      if (!p) return "<h1>Not found</h1><p>0 results</p>";
+      return "<h1>Product " + sku + "</h1>" +
+        '<label for="ean-field">EAN</label> <input id="ean-field" value="' + p.ean + '" />' +
+        '<button class="sc-zzz999" id="commit-btn">Save changes</button>' +
+        '<p id="status" aria-live="polite"></p>';
+    }
+
+    function render() {
+      var m = location.hash.match(/^#\/product\/(\w+)/);
+      document.getElementById("app").innerHTML = m ? detailHtml(m[1]) : gridHtml();
+    }
+
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && e.target && e.target.id === "grid-search") {
+        filter = e.target.value;
+        render();
+      }
+    });
+
+    document.addEventListener("click", function (e) {
+      var tr = e.target.closest ? e.target.closest("tr[data-sku]") : null;
+      if (tr) { location.hash = "#/product/" + tr.getAttribute("data-sku"); return; }
+      if (e.target && e.target.id === "commit-btn") {
+        var m = location.hash.match(/^#\/product\/(\w+)/);
+        PRODUCTS[m[1]].ean = document.getElementById("ean-field").value;
+        document.getElementById("status").textContent = "Saved";
+      }
+    });
+
+    window.addEventListener("hashchange", render);
+    render();
+  </script>
+</body>
+</html>
