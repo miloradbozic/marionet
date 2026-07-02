@@ -14,17 +14,30 @@ const WORKSPACE_ROOT = path.resolve(process.cwd(), "workspace");
 
 let browser: Browser | undefined;
 let page: Page | undefined;
+const hookedContexts = new WeakSet<ReturnType<Browser["contexts"]>[number]>();
 
 // Connects lazily, on first browser tool call, so a run that never touches
 // the browser doesn't fail just because Chrome isn't running with
 // --remote-debugging-port yet.
+//
+// Page selection: sticky. We keep using the page we already have until it
+// closes. A "page" event on the context (popup, target=_blank) switches the
+// active page to the new one -- clicking something that opens a tab should
+// mean subsequent actions target that tab, not the original.
 async function getPage(): Promise<Page> {
-  if (page && !page.isClosed()) return page;
   if (!browser || !browser.isConnected()) {
     browser = await chromium.connectOverCDP(CDP_ENDPOINT);
+    page = undefined;
   }
   const context = browser.contexts()[0] ?? (await browser.newContext());
-  page = context.pages()[0] ?? (await context.newPage());
+  if (!hookedContexts.has(context)) {
+    hookedContexts.add(context);
+    context.on("page", (newPage) => {
+      page = newPage;
+    });
+  }
+  if (page && !page.isClosed()) return page;
+  page = context.pages().find((p) => !p.isClosed()) ?? (await context.newPage());
   return page;
 }
 

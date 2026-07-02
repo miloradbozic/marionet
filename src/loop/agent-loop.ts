@@ -1,5 +1,5 @@
 import type OpenAI from "openai";
-import { estimateCostUsd } from "../llm-client.js";
+import { estimateCostUsd, withLlmRetry } from "../llm-client.js";
 import type { McpClientManager } from "../mcp/mcp-client-manager.js";
 import type { PolicyEngine } from "../policy/policy-engine.js";
 import { confirmToolCall } from "../confirm/cli-prompt.js";
@@ -12,13 +12,15 @@ You are marionet, an autonomous agent with shell, filesystem, and browser access
 
 When the task is complete, or you determine it cannot be completed, you must call finish_task -- do not just stop responding or produce a final text-only answer. That is the only way this run ends.
 
+Finishing with status "success" requires a verification: a read-only tool call the system executes to independently confirm the outcome (e.g. browser__eval reading an input's .value, fs__read of a written file, a read-only shell command). Choose a check that reads durable state -- never a success toast or notification, those disappear and are unreliable. If verification fails you will get the result back and the run continues: fix the problem or finish with status "failure".
+
 Some tool calls pause for human confirmation; a denied call returns an error tool_result explaining why. If one is denied, adapt your approach rather than retrying the same call, or call finish_task with status "blocked".
 
 Efficiency rules — these are hard constraints, not suggestions:
 - At the start of any browser task, read the site playbook first: Akeneo (any akeneo URL) → fs__read sites/akeneo.md. The playbook contains the real site URL and cached selectors. When the playbook covers a step you are about to take, follow it exactly without any extra inspection or extraction first.
 - After reading the playbook, call browser__cache_read using the ACTUAL site URL from the playbook or task (e.g. https://test-opari.cloud.akeneo.com -- never use example.com or placeholder URLs). If it returns cached data, use those selectors IMMEDIATELY and DIRECTLY -- do not call browser__extract or any other tool to "verify" or "explore" first. Skip all discovery entirely. After a flow succeeds, call browser__cache_write with only the keys the next run can use directly (flat object, no prose).
-- Do NOT extract page state to confirm a click or fill succeeded. Trust tool calls unless they return an error. Bad pattern: navigate → extract → click → extract → fill → extract. Good pattern: navigate → click → fill → save → finish_task. Only extract when you need data to decide the NEXT action.
-- After executing a save (JS click or browser__submit_form), call finish_task immediately. Do not try to verify the save via extraction -- the success toast disappears in seconds and is unreliable. If the save JS ran without throwing an error, the save succeeded.
+- Do NOT extract page state mid-flow to confirm a click or fill succeeded. Trust tool calls unless they return an error. Bad pattern: navigate → extract → click → extract → fill → extract. Good pattern: navigate → click → fill → save → finish_task (with verification). Only extract when you need data to decide the NEXT action.
+- After executing a save (JS click or browser__submit_form), call finish_task immediately with a verification that re-reads the saved state deterministically (e.g. browser__eval on the input's .value). Do not check success toasts -- they disappear in seconds and are unreliable.
 - NEVER use browser__extract with format "html" and selector "body" or no selector. This is banned -- it costs 10x tokens for near-zero value. HTML extracts must always use a specific, narrow selector. Use text format for reading content.
 - NEVER take a screenshot except as a last resort when completely stuck.
 - Before filling any login form, check if the page is already authenticated (dashboard visible, no login form). If already logged in, skip login entirely.
@@ -54,6 +56,74 @@ export interface AgentLoopResult {
   details?: string;
 }
 
+function textOfResult(result: { content: Array<{ type: string; text?: string }> }): string {
+  return result.content
+    .map((block) => (block.type === "text" ? (block.text ?? "") : `[${block.type}]`))
+    .join("\n");
+}
+
+/**
+ * Executes the model-proposed verification for a successful finish_task and
+ * returns a rejection message if the run must NOT end, or null if it may.
+ * The verification call goes through the same policy gate as any tool call,
+ * so the model cannot use it to smuggle in a denied action.
+ */
+async function runFinishVerification(input: FinishTaskInput, opts: AgentLoopOptions): Promise<string | null> {
+  const v = input.verification;
+  if (!v || !v.tool || !v.expectPattern) {
+    return 'finish_task rejected: status "success" requires a verification ({ tool, args, expectPattern }) -- a read-only tool call that independently confirms the outcome. Provide one, or finish with status "failure" or "blocked".';
+  }
+
+  const decision = opts.policy.evaluate(v.tool, v.args ?? {});
+  opts.logger.log({ type: "policy_decision", tool: v.tool, action: decision.action, matchedRule: decision.matchedRule, context: "finish_verification" });
+  if (decision.action === "deny") {
+    return `finish_task rejected: verification tool "${v.tool}" is denied by policy. Choose a different read-only verification.`;
+  }
+  if (decision.action === "ask") {
+    const confirmation = await confirmToolCall(v.tool, v.args ?? {}, decision.matchedRule, `verification for finish_task: ${input.summary}`);
+    if (!confirmation.approved) {
+      return `finish_task rejected: verification was denied by the human operator.${confirmation.note ? ` Reason: ${confirmation.note}` : ""}`;
+    }
+  }
+
+  let resultText: string;
+  let isError = false;
+  try {
+    const result = await opts.mcpClientManager.callTool(v.tool, v.args ?? {});
+    resultText = textOfResult(result);
+    isError = Boolean(result.isError);
+  } catch (err) {
+    resultText = err instanceof Error ? err.message : String(err);
+    isError = true;
+  }
+
+  let matched = false;
+  let patternError: string | null = null;
+  try {
+    matched = !isError && new RegExp(v.expectPattern).test(resultText);
+  } catch (err) {
+    patternError = err instanceof Error ? err.message : String(err);
+  }
+
+  opts.logger.log({
+    type: "verification",
+    tool: v.tool,
+    args: v.args ?? {},
+    expectPattern: v.expectPattern,
+    matched,
+    isError,
+    resultText: resultText.slice(0, 2000),
+  });
+
+  if (patternError) {
+    return `finish_task rejected: expectPattern is not a valid regex (${patternError}).`;
+  }
+  if (!matched) {
+    return `finish_task rejected: verification failed. ${isError ? "Verification tool errored" : `Result did not match /${v.expectPattern}/`}. Tool result:\n${resultText.slice(0, 2000)}\n\nFix the problem and finish again, or finish with status "failure".`;
+  }
+  return null;
+}
+
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
   const messages: OpenAI.ChatCompletionMessageParam[] = [
     { role: "system", content: SYSTEM_PROMPT },
@@ -78,12 +148,18 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       return { status: "halted", summary: `Stopped after exceeding the $${opts.maxCostUsd} cost ceiling.` };
     }
 
-    const response = await opts.llmClient.chat.completions.create({
-      model: opts.model,
-      max_tokens: opts.maxTokens,
-      tools,
-      messages,
-    });
+    const response = await withLlmRetry(
+      () =>
+        opts.llmClient.chat.completions.create({
+          model: opts.model,
+          max_tokens: opts.maxTokens,
+          tools,
+          messages,
+        }),
+      {
+        onRetry: ({ attempt, error, delayMs }) => opts.logger.log({ type: "llm_retry", attempt, error, delayMs }),
+      },
+    );
 
     const choice = response.choices[0]!;
     const text = choice.message.content ?? undefined;
@@ -132,6 +208,16 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 
       if (name === FINISH_TASK_TOOL_NAME) {
         const input = args as unknown as FinishTaskInput;
+
+        if (input.status === "success") {
+          const rejection = await runFinishVerification(input, opts);
+          if (rejection) {
+            opts.logger.log({ type: "finish_rejected", reason: rejection });
+            messages.push({ role: "tool", tool_call_id: tc.id, content: rejection });
+            continue;
+          }
+        }
+
         opts.logger.log({ type: "finish_task", status: input.status, summary: input.summary, details: input.details });
         finishResult = { status: input.status, summary: input.summary, details: input.details };
         messages.push({ role: "tool", tool_call_id: tc.id, content: "Task finished." });

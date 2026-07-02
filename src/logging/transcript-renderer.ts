@@ -49,6 +49,17 @@ export function renderTranscript(runDir: string): string {
       case "tool_result":
         parts.push(`  - result${event.isError ? " (error)" : ""}: ${summarizeContent(event.content)}`);
         break;
+      case "verification":
+        parts.push(
+          `  - verification: \`${event.tool}\` vs /${event.expectPattern}/ -> **${event.matched ? "matched" : "failed"}**`,
+        );
+        break;
+      case "finish_rejected":
+        parts.push(`  - finish_task **rejected**: ${(event.reason as string).slice(0, 300)}`);
+        break;
+      case "llm_retry":
+        parts.push(`  - (llm retry ${event.attempt}: ${event.error as string})`);
+        break;
       case "finish_task":
         parts.push(`\n### Finished: ${event.status as string}\n${event.summary as string}`);
         break;
