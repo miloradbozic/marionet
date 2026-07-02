@@ -16,6 +16,12 @@ Finishing with status "success" requires a verification: a read-only tool call t
 
 Some tool calls pause for human confirmation; a denied call returns an error tool_result explaining why. If one is denied, adapt your approach rather than retrying the same call, or call finish_task with status "blocked".
 
+Browser perception — how to find elements:
+- Use browser__snapshot to see the page: it lists every visible interactive element with a ref (e1, e2, ...), role, name, and state. Act on refs with browser__click_ref / browser__fill_ref (and browser__fill_from_env with ref for secrets). Do NOT guess CSS selectors; snapshot first, then act.
+- Use the query argument to filter large pages (e.g. query "save" to find save buttons) and scope to limit to a region.
+- Refs expire on navigation and framework re-renders. After a page-changing action, re-snapshot before acting on old refs. If a ref-based call fails, re-snapshot.
+- CSS-selector tools (browser__click, browser__fill, browser__wait_for) remain available for selectors you know from a playbook or cache; prefer refs for anything discovered fresh.
+
 Efficiency rules — these are hard constraints, not suggestions:
 - At the start of any browser task, read the site playbook first: Akeneo (any akeneo URL) → fs__read sites/akeneo.md. The playbook contains the real site URL and cached selectors. When the playbook covers a step you are about to take, follow it exactly without any extra inspection or extraction first.
 - After reading the playbook, call browser__cache_read using the ACTUAL site URL from the playbook or task (e.g. https://test-opari.cloud.akeneo.com -- never use example.com or placeholder URLs). If it returns cached data, use those selectors IMMEDIATELY and DIRECTLY -- do not call browser__extract or any other tool to "verify" or "explore" first. Skip all discovery entirely. After a flow succeeds, call browser__cache_write with only the keys the next run can use directly (flat object, no prose).
@@ -23,7 +29,7 @@ Efficiency rules — these are hard constraints, not suggestions:
 - After executing a save (JS click or browser__submit_form), call finish_task immediately with a verification that re-reads the saved state deterministically (e.g. browser__eval on the input's .value). Do not check success toasts -- they disappear in seconds and are unreliable.
 - NEVER use browser__extract with format "html" and selector "body" or no selector. This is banned -- it costs 10x tokens for near-zero value. HTML extracts must always use a specific, narrow selector. Use text format for reading content.
 - NEVER take a screenshot except as a last resort when completely stuck.
-- Before filling any login form, check if the page is already authenticated (dashboard visible, no login form). If already logged in, skip login entirely.
+- After navigating to a site, take a browser__snapshot FIRST to see the actual page state -- never browser__wait_for a login field to "check" if login is needed (a 30s timeout on an already-authenticated page is pure waste). If the snapshot shows a login form, log in; if it shows the app, proceed.
 - Batch independent tool calls in a single response (e.g. fill multiple fields at once, not one per turn).
 - Prefer clicking navigation elements over guessing URLs -- SPAs use hash or API-driven routing that is hard to predict.`;
 

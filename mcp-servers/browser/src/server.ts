@@ -4,6 +4,7 @@ import { z } from "zod";
 import { chromium, type Browser, type Page } from "playwright";
 import path from "node:path";
 import { promises as fs } from "node:fs";
+import { buildSnapshot, renderSnapshot, refSelector, REF_MISS_HINT } from "./snapshot.js";
 
 // Never launches its own browser -- always attaches over CDP to a browser the
 // human started and authenticated manually. Re-triggering an automated login
@@ -59,6 +60,75 @@ server.registerTool(
       const p = await getPage();
       await p.goto(url, { waitUntil: "domcontentloaded" });
       return { content: [{ type: "text" as const, text: `Navigated to ${p.url()} ("${await p.title()}")` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__snapshot",
+  {
+    description:
+      "Structured snapshot of the current page: every visible interactive element (buttons, links, inputs, selects, ...) with its role, accessible name, current state, and a ref (e1, e2, ...). Use refs with browser__click_ref / browser__fill_ref instead of guessing CSS selectors. Refs expire on navigation or framework re-render -- re-snapshot after page-changing actions. Use `query` to filter elements by text, `scope` to limit to a page region.",
+    inputSchema: {
+      query: z.string().optional().describe("Case-insensitive substring filter on element lines, e.g. 'save' or 'marketing'"),
+      scope: z.string().optional().describe("CSS selector to scope the snapshot to a page region"),
+      maxElements: z.number().int().positive().max(1000).optional().describe("Cap on returned elements (default 300)"),
+    },
+  },
+  async ({ query, scope, maxElements }) => {
+    try {
+      const p = await getPage();
+      const result = await buildSnapshot(p, { query, scope, maxElements });
+      return { content: [{ type: "text" as const, text: renderSnapshot(result) }], isError: Boolean(result.scopeError) };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__click_ref",
+  {
+    description:
+      "Click an element by its snapshot ref (e.g. 'e12') from browser__snapshot. Preferred over browser__click with CSS selectors.",
+    inputSchema: { ref: z.string().describe("Snapshot ref, e.g. e12") },
+  },
+  async ({ ref }) => {
+    try {
+      const p = await getPage();
+      const selector = refSelector(ref);
+      if ((await p.locator(selector).count()) === 0) {
+        return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
+      }
+      await p.click(selector, { timeout: 15_000 });
+      return { content: [{ type: "text" as const, text: `Clicked ${ref}` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__fill_ref",
+  {
+    description:
+      "Fill a text input/textarea by its snapshot ref (e.g. 'e7') from browser__snapshot. Preferred over browser__fill with CSS selectors. For secrets use browser__fill_from_env with the ref argument instead.",
+    inputSchema: {
+      ref: z.string().describe("Snapshot ref, e.g. e7"),
+      value: z.string(),
+    },
+  },
+  async ({ ref, value }) => {
+    try {
+      const p = await getPage();
+      const selector = refSelector(ref);
+      if ((await p.locator(selector).count()) === 0) {
+        return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
+      }
+      await p.fill(selector, value, { timeout: 15_000 });
+      return { content: [{ type: "text" as const, text: `Filled ${ref} with "${value}"` }] };
     } catch (err) {
       return errorResult(err);
     }
@@ -153,21 +223,29 @@ server.registerTool(
   "browser__fill_from_env",
   {
     description:
-      "Fill a text input with a value read from an environment variable on the local machine. Use this instead of browser__fill whenever the value is a secret (password, API key, etc.) so the actual secret is never sent to the model.",
+      "Fill a text input with a value read from an environment variable on the local machine. Use this instead of browser__fill/browser__fill_ref whenever the value is a secret (password, API key, etc.) so the actual secret is never sent to the model. Target the field with either a snapshot ref (preferred) or a CSS selector.",
     inputSchema: {
-      selector: z.string(),
+      ref: z.string().optional().describe("Snapshot ref from browser__snapshot, e.g. e7 (preferred)"),
+      selector: z.string().optional().describe("CSS selector, if no snapshot ref is available"),
       env_var: z.string().describe("Name of the environment variable whose value will be typed into the field"),
     },
   },
-  async ({ selector, env_var }) => {
+  async ({ ref, selector, env_var }) => {
     try {
       const value = process.env[env_var];
       if (value === undefined) {
         return { content: [{ type: "text" as const, text: `Error: environment variable "${env_var}" is not set` }], isError: true };
       }
+      if (!ref && !selector) {
+        return { content: [{ type: "text" as const, text: "Error: provide either ref or selector" }], isError: true };
+      }
       const p = await getPage();
-      await p.fill(selector, value, { timeout: 15_000 });
-      return { content: [{ type: "text" as const, text: `Filled ${selector} from env var ${env_var}` }] };
+      const target = ref ? refSelector(ref) : selector!;
+      if (ref && (await p.locator(target).count()) === 0) {
+        return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
+      }
+      await p.fill(target, value, { timeout: 15_000 });
+      return { content: [{ type: "text" as const, text: `Filled ${ref ?? selector} from env var ${env_var}` }] };
     } catch (err) {
       return errorResult(err);
     }

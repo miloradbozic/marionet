@@ -28,6 +28,10 @@
     { match: "fs__list", action: "allow" },
 
     { match: "browser__navigate", action: "allow" },
+    // Read-only page perception; the preferred first step of any browser flow.
+    { match: "browser__snapshot", action: "allow" },
+    { match: "browser__click_ref", action: "allow" },
+    { match: "browser__fill_ref", action: "allow" },
     { match: "browser__click", action: "allow" },
     { match: "browser__fill", action: "allow" },
     // fill_from_env resolves secrets locally -- the value never reaches the model.
