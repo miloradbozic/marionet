@@ -33,6 +33,9 @@ Efficiency rules — these are hard constraints, not suggestions:
 - Batch independent tool calls in a single response (e.g. fill multiple fields at once, not one per turn).
 - Prefer clicking navigation elements over guessing URLs -- SPAs use hash or API-driven routing that is hard to predict.`;
 
+/** How many identical failing tool calls before the loop guard escalates. */
+const REPEAT_FAILURE_LIMIT = 3;
+
 /** Minimal surface the loop needs -- lets tests inject a fake. */
 export interface LlmMessagesClient {
   chat: {
@@ -143,6 +146,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   let totalCostUsd = 0;
   let iter = 0;
   let nudges = 0;
+  const failureCounts = new Map<string, number>();
 
   for (;;) {
     iter++;
@@ -271,33 +275,48 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       }
 
       const start = Date.now();
+      let content: string;
+      let isError: boolean;
       try {
         const result = await opts.mcpClientManager.callTool(name, args);
+        isError = Boolean(result.isError);
         opts.logger.log({
           type: "tool_result",
           toolUseId: tc.id,
           tool: name,
-          isError: Boolean(result.isError),
+          isError,
           durationMs: Date.now() - start,
           content: result.content,
         });
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: mcpResultToToolContent(result, opts.supportsVision ?? true),
-        });
+        content = mcpResultToToolContent(result, opts.supportsVision ?? true);
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        isError = true;
+        content = err instanceof Error ? err.message : String(err);
         opts.logger.log({
           type: "tool_result",
           toolUseId: tc.id,
           tool: name,
           isError: true,
           durationMs: Date.now() - start,
-          content: [{ type: "text", text: message }],
+          content: [{ type: "text", text: content }],
         });
-        messages.push({ role: "tool", tool_call_id: tc.id, content: message });
       }
+
+      // Loop guard: a model that keeps re-issuing the *same* failing call is
+      // stuck, not making progress. After a few identical failures, escalate
+      // the tool result with an explicit course-correction so it stops burning
+      // turns on a doomed action (see the Akeneo search loop, run deesdu).
+      if (isError && typeof content === "string") {
+        const signature = `${name}:${tc.function.arguments}`;
+        const count = (failureCounts.get(signature) ?? 0) + 1;
+        failureCounts.set(signature, count);
+        if (count >= REPEAT_FAILURE_LIMIT) {
+          opts.logger.log({ type: "loop_guard", tool: name, count });
+          content = `${content}\n\n[marionet] You have now called ${name} with these exact arguments ${count} times and it has failed every time. Stop repeating it. Do something different: take a browser__snapshot to find the real element, try a different tool or selector, or call finish_task with status "blocked" if you genuinely cannot proceed.`;
+        }
+      }
+
+      messages.push({ role: "tool", tool_call_id: tc.id, content });
     }
 
     if (finishResult) return finishResult;
