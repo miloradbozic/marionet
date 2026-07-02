@@ -1,5 +1,5 @@
 import path from "node:path";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { loadRunConfig } from "./mcp/server-registry.js";
 import { McpClientManager } from "./mcp/mcp-client-manager.js";
@@ -8,8 +8,10 @@ import { RunLogger, type RunMeta } from "./logging/run-logger.js";
 import { renderTranscript } from "./logging/transcript-renderer.js";
 import { runAgentLoop } from "./loop/agent-loop.js";
 import { createLlmClient } from "./llm-client.js";
-import { compileRun, heuristicNamer, llmNamer, type Namer } from "./compiler/compile.js";
+import { compileRun } from "./compiler/compile.js";
+import { llmSegmenter, monolithSegmenter, type Segmenter } from "./compiler/segment.js";
 import { parseEvents } from "./compiler/trajectory.js";
+import { writeSkillFiles, appendPlaybookNotes } from "./compiler/emit.js";
 import {
   filterEnvForClient,
   loadClientProfile,
@@ -150,38 +152,67 @@ async function compileCommand(repoRoot: string, runId: string | undefined, useHe
   const meta = JSON.parse(readFileSync(path.join(runDir, "meta.json"), "utf-8")) as RunMeta;
   const events = parseEvents(readFileSync(path.join(runDir, "events.jsonl"), "utf-8"));
 
-  let namer: Namer = heuristicNamer;
+  // Segmentation quality follows the model that recorded the run, so prefer
+  // meta.model; fall back to the currently-configured model, then offline.
+  let segmenter: Segmenter = monolithSegmenter;
   if (!useHeuristic) {
+    const candidates = [meta.model];
     try {
-      const runConfig = loadRunConfig(path.join(repoRoot, "config", "run.config.json"));
-      const { client, effectiveModel } = createLlmClient(runConfig.model);
-      namer = llmNamer(client, effectiveModel);
-    } catch (err) {
-      console.warn(`(no LLM available for naming: ${err instanceof Error ? err.message : String(err)}; using heuristic names)`);
+      candidates.push(loadRunConfig(path.join(repoRoot, "config", "run.config.json")).model);
+    } catch {
+      /* no config -- meta.model only */
+    }
+    let lastErr: unknown;
+    for (const model of candidates) {
+      try {
+        const { client, effectiveModel } = createLlmClient(model);
+        segmenter = llmSegmenter(client, effectiveModel);
+        break;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    if (segmenter === monolithSegmenter) {
+      console.warn(
+        `(no LLM available for segmentation: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}; compiling monolithically)`,
+      );
     }
   }
 
-  const skill = await compileRun({
+  const result = await compileRun({
     events,
     runId: meta.runId,
     task: meta.task,
     model: meta.model,
     client: meta.client,
     metaStatus: meta.status,
-    namer,
+    segmenter,
   });
+
+  if (result.fallbackReason) {
+    console.warn(`(LLM segmentation rejected: ${result.fallbackReason}; compiled monolithically)`);
+  }
 
   const skillsDir = meta.client
     ? path.join(repoRoot, "clients", meta.client, "skills")
     : path.join(repoRoot, "workspace", "skills");
-  mkdirSync(skillsDir, { recursive: true });
-  const outPath = path.join(skillsDir, `${skill.name}.json`);
-  writeFileSync(outPath, JSON.stringify(skill, null, 2) + "\n");
+  const written = writeSkillFiles(skillsDir, result);
+  for (const w of written) {
+    const kindLabel = w.skill.kind === "flow" ? "flow" : "skill";
+    console.log(`Compiled ${kindLabel} "${w.skill.name}" from run ${meta.runId}${w.overwrote ? " (overwrote existing)" : ""}`);
+    console.log(`  params: ${w.skill.params.map((p) => `${p.name}=${p.example}`).join(", ") || "(none)"}`);
+    if (w.skill.kind === "flow") {
+      console.log(`  calls: ${w.skill.calls.map((c) => c.skill).join(" -> ")}`);
+    } else {
+      console.log(`  steps: ${w.skill.steps.length}, post-condition: ${w.skill.postCondition.tool}`);
+    }
+    console.log(`  -> ${w.path}`);
+  }
 
-  console.log(`Compiled skill "${skill.name}" from run ${meta.runId}`);
-  console.log(`  params: ${skill.params.map((p) => `${p.name}=${p.example}`).join(", ") || "(none)"}`);
-  console.log(`  steps: ${skill.steps.length}, post-condition: ${skill.postCondition.tool}`);
-  console.log(`  -> ${outPath}`);
+  if (meta.client && result.playbookNotes.length) {
+    const playbookPath = appendPlaybookNotes(repoRoot, meta.client, meta.runId, result.playbookNotes);
+    if (playbookPath) console.log(`Playbook updated: ${playbookPath} (+${result.playbookNotes.length} note(s))`);
+  }
 }
 
 async function main(): Promise<void> {
