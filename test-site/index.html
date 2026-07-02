@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Marionet Test Site</title>
+  <style>
+    body { font-family: sans-serif; max-width: 640px; margin: 2rem auto; }
+    .hidden-legacy { display: none; }
+    .sc-kAyceB { padding: 6px 12px; } /* obfuscated CSS-in-JS-style class, changes "every deploy" */
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="#products">Products</a>
+    <a href="#settings">Settings</a>
+  </nav>
+
+  <h1>Product editor</h1>
+
+  <!-- Legacy layer: present in the DOM but hidden, like Akeneo's PHP UI.
+       Must NOT appear in snapshots and must not be clickable. -->
+  <button class="hidden-legacy save">Save</button>
+
+  <input type="search" placeholder="Search attributes by label or code" />
+
+  <form id="login">
+    <label for="username">Username</label>
+    <input id="username" type="text" />
+    <label for="password">Password</label>
+    <input id="password" type="password" />
+    <button type="submit">Log in</button>
+  </form>
+
+  <div id="editor">
+    <label for="marketing-title">Marketing Titel</label>
+    <input id="marketing-title" type="text" data-testid="marketing_titel" />
+
+    <label>
+      <input type="checkbox" id="exclusive" /> Exklusiver Anbieter
+    </label>
+
+    <label for="canton">Canton</label>
+    <select id="canton">
+      <option>Zürich</option>
+      <option>Bern</option>
+    </select>
+
+    <!-- JS-driven "modern" layer: visible save button with unstable class
+         and no type=submit, plus a role=button div. -->
+    <button class="sc-kAyceB" id="modern-save">Save</button>
+    <div role="button" id="duplicate" tabindex="0">Duplicate product</div>
+  </div>
+
+  <p id="status" aria-live="polite"></p>
+
+  <script>
+    document.getElementById("modern-save").addEventListener("click", () => {
+      document.getElementById("status").textContent =
+        "Saved: " + document.getElementById("marketing-title").value;
+    });
+    document.getElementById("login").addEventListener("submit", (e) => {
+      e.preventDefault();
+      document.getElementById("status").textContent = "Logged in";
+    });
+  </script>
+</body>
+</html>

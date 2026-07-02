@@ -16,6 +16,12 @@ Finishing with status "success" requires a verification: a read-only tool call t
 
 Some tool calls pause for human confirmation; a denied call returns an error tool_result explaining why. If one is denied, adapt your approach rather than retrying the same call, or call finish_task with status "blocked".
 
+Browser perception — how to find elements:
+- Use browser__snapshot to see the page: it lists every visible interactive element with a ref (e1, e2, ...), role, name, and state. Act on refs with browser__click_ref / browser__fill_ref (and browser__fill_from_env with ref for secrets). Do NOT guess CSS selectors; snapshot first, then act.
+- Use the query argument to filter large pages (e.g. query "save" to find save buttons) and scope to limit to a region.
+- Refs expire on navigation and framework re-renders. After a page-changing action, re-snapshot before acting on old refs. If a ref-based call fails, re-snapshot.
+- CSS-selector tools (browser__click, browser__fill, browser__wait_for) remain available for selectors you know from a playbook or cache; prefer refs for anything discovered fresh.
+
 Efficiency rules — these are hard constraints, not suggestions:
 - At the start of any browser task, read the site playbook first: Akeneo (any akeneo URL) → fs__read sites/akeneo.md. The playbook contains the real site URL and cached selectors. When the playbook covers a step you are about to take, follow it exactly without any extra inspection or extraction first.
 - After reading the playbook, call browser__cache_read using the ACTUAL site URL from the playbook or task (e.g. https://test-opari.cloud.akeneo.com -- never use example.com or placeholder URLs). If it returns cached data, use those selectors IMMEDIATELY and DIRECTLY -- do not call browser__extract or any other tool to "verify" or "explore" first. Skip all discovery entirely. After a flow succeeds, call browser__cache_write with only the keys the next run can use directly (flat object, no prose).

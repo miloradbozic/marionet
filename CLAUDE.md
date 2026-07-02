@@ -54,6 +54,8 @@ Both servers are in `mcp-servers/` and are separate npm workspaces (`mcp-servers
 **core** (`mcp-servers/core/src/server.ts`): `shell__exec`, `fs__read`, `fs__write`, `fs__list`. Shell commands run in `workspace/` by default.
 
 **browser** (`mcp-servers/browser/src/server.ts`): Attaches to an already-running Chrome over CDP (`MARIONET_BROWSER_CDP_ENDPOINT`, default `http://localhost:9222`). Never launches its own browser. Key tools:
+- `browser__snapshot` — filtered accessibility-style view of the page: every visible interactive element with role, accessible name, state, and a ref (`e1`, `e2`, ...). The preferred perception tool; refs expire on navigation/re-render (implementation: `snapshot.ts`, tags elements with `data-marionet-ref`).
+- `browser__click_ref` / `browser__fill_ref` — act on snapshot refs instead of guessed CSS selectors. `browser__fill_from_env` also accepts a `ref`.
 - `browser__fill_from_env` — fills an input from a named env var; the secret value never reaches the model. Use this instead of `browser__fill` for passwords/API keys.
 - `browser__submit_form` — finds `[type=submit]` within the given selector and clicks it. Works for standard HTML forms; does **not** work for JS-driven forms with no native submit button, or submit buttons outside the `<form>` tag (use `browser__click` directly in those cases). If broadening: consider an explicit `submitSelector` param.
 
