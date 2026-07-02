@@ -31,6 +31,7 @@
     // Read-only page perception; the preferred first step of any browser flow.
     { match: "browser__snapshot", action: "allow" },
     { match: "browser__click_ref", action: "allow" },
+    { match: "browser__click_text", action: "allow" },
     { match: "browser__fill_ref", action: "allow" },
     { match: "browser__click", action: "allow" },
     { match: "browser__fill", action: "allow" },

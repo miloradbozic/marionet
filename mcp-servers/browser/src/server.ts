@@ -157,6 +157,63 @@ server.registerTool(
 );
 
 server.registerTool(
+  "browser__click_text",
+  {
+    description:
+      "Click the element whose visible text matches `text` (substring by default, or exact). Use this to click a table row, list item, link, or button by what it SAYS -- e.g. open a grid row by its ID/SKU -- instead of hand-writing JS in browser__eval or guessing a CSS selector. If the match is inside a table row (<tr>) the whole row is clicked (data grids open on row click); otherwise the nearest <a>/<button> ancestor, else the matched element. Returns what was clicked and whether the page navigated -- a click that does not navigate when you expected an edit page means the row wasn't really opened. Returns an error if no element contains the text (for a search result, that means no such row -- confirm the empty state, don't retry forever).",
+    inputSchema: {
+      text: z.string().describe("Visible text to match, e.g. a product SKU or a link label"),
+      exact: z.boolean().optional().describe("Require the matched element's text to equal `text` exactly (default: substring match)"),
+    },
+  },
+  async ({ text, exact }) => {
+    try {
+      const p = await getPage();
+      const before = p.url();
+      // Raw string (not a function) so esbuild/tsx keepNames can't inject an
+      // undefined __name into the page (same hazard as snapshot.ts / settle).
+      const expr = `(() => {
+        var norm = function (s) { return (s || "").replace(/\\s+/g, " ").trim(); };
+        var t = norm(${JSON.stringify(text)});
+        var exact = ${exact ? "true" : "false"};
+        var all = Array.prototype.slice.call(document.querySelectorAll("body *"));
+        var matches = all.filter(function (el) {
+          var et = norm(el.textContent);
+          return exact ? et === t : et.indexOf(t) !== -1;
+        });
+        // Deepest (fewest descendants) match first: target the specific cell, not a wrapping container.
+        matches.sort(function (a, b) { return a.querySelectorAll("*").length - b.querySelectorAll("*").length; });
+        var hit = matches[0];
+        if (!hit) return null;
+        var target = hit.closest("tr") || hit.closest("a,button,[role=button],[role=link]") || hit;
+        try { target.scrollIntoView({ block: "center" }); } catch (e) {}
+        target.click();
+        return { tag: target.tagName, text: norm(target.textContent).slice(0, 80) };
+      })()`;
+      const clicked = (await p.evaluate(expr)) as { tag: string; text: string } | null;
+      if (!clicked) {
+        return {
+          content: [{ type: "text" as const, text: `No element found containing text "${text}".` }],
+          isError: true,
+        };
+      }
+      await settle(p);
+      const navigated = p.url() !== before;
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Clicked ${clicked.tag} "${clicked.text}"` + (navigated ? ` — navigated to ${p.url()}` : " — page did not navigate"),
+          },
+        ],
+      };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
   "browser__fill_ref",
   {
     description:
