@@ -243,6 +243,12 @@ function collectElements(args: CollectArgs): CollectResult {
 }
 
 export async function buildSnapshot(page: Page, opts: SnapshotOptions = {}): Promise<SnapshotResult> {
+  // tsx/esbuild compiles with keepNames, which injects `__name(...)` helper
+  // calls into function bodies. Playwright serializes collectElements into
+  // the page, where that helper doesn't exist -- shim it first, or every
+  // snapshot fails with "ReferenceError: __name is not defined" in
+  // production (but not under vitest, which compiles without the helper).
+  await page.evaluate("void (globalThis.__name = globalThis.__name || ((fn) => fn))");
   const collected = await page.evaluate(collectElements, {
     scope: opts.scope ?? null,
     query: opts.query ?? null,
