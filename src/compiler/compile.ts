@@ -1,88 +1,7 @@
-import type { OpenAI } from "openai";
-import { withLlmRetry } from "../llm-client.js";
-import { detectLiterals, parameterize } from "./parameterize.js";
+import { detectLiterals, buildMapping, parameterizeStep, parameterizePostCondition } from "./parameterize.js";
 import { assertCompilable, extractTrajectory, type RunEvent } from "./trajectory.js";
-import type { Skill, SkillParam, SkillPostCondition, SkillStep } from "./skill.types.js";
-
-export interface NamerInput {
-  task: string;
-  steps: SkillStep[];
-  postCondition: SkillPostCondition;
-  /** The detected literal values that will become parameters. */
-  literals: string[];
-}
-
-export interface NamerOutput {
-  /** snake_case skill name, e.g. "open_product_by_sku". */
-  skillName: string;
-  /** One-sentence description of what the skill does. */
-  description: string;
-  /** Maps each detected literal value -> a param name, e.g. { "901384900": "sku" }. */
-  paramNames: Record<string, string>;
-}
-
-export type Namer = (input: NamerInput) => Promise<NamerOutput>;
-
-/**
- * Offline fallback namer: derives a skill name from the task and names params
- * positionally (param1, param2...). Deterministic; used when no LLM is
- * available or for tests that don't care about semantic names.
- */
-export const heuristicNamer: Namer = async ({ task, literals }) => {
-  const slug =
-    task
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .split("_")
-      .slice(0, 6)
-      .join("_") || "skill";
-  const paramNames: Record<string, string> = {};
-  literals.forEach((lit, i) => {
-    paramNames[lit] = `param${i + 1}`;
-  });
-  return { skillName: slug, description: task, paramNames };
-};
-
-const NAMER_SYSTEM = `You name a reusable automation "skill" compiled from one successful run.
-Given the task, the executed steps, and the literal values that will be turned into parameters, return STRICT JSON:
-{ "skillName": "snake_case_verb_noun", "description": "one sentence", "paramNames": { "<literal>": "snake_case_param" } }
-Rules: skillName is a short snake_case verb_noun (e.g. open_product_by_sku, set_attribute). Every literal in the input MUST get a paramNames entry; choose a meaningful name from how the value is used in the task (an id/code the task acts on -> its noun like "sku"; a value being written -> the field name like "ean"). Output ONLY the JSON object, no prose.`;
-
-/** LLM-backed namer: one cheap call that returns skill/param names as JSON. */
-export function llmNamer(client: OpenAI, model: string): Namer {
-  return async ({ task, steps, postCondition, literals }) => {
-    const user = JSON.stringify({ task, steps, postCondition, literals });
-    const res = await withLlmRetry(() =>
-      client.chat.completions.create({
-        model,
-        messages: [
-          { role: "system", content: NAMER_SYSTEM },
-          { role: "user", content: user },
-        ],
-      }),
-    );
-    const text = res.choices[0]?.message?.content ?? "";
-    const parsed = parseNamerJson(text);
-    // Guarantee every literal is covered even if the model missed one.
-    for (const lit of literals) {
-      if (!parsed.paramNames[lit]) parsed.paramNames[lit] = `param${literals.indexOf(lit) + 1}`;
-    }
-    return parsed;
-  };
-}
-
-function parseNamerJson(text: string): NamerOutput {
-  const match = text.match(/\{[\s\S]*\}/);
-  const raw = match ? match[0] : text;
-  const obj = JSON.parse(raw) as Partial<NamerOutput>;
-  if (!obj.skillName || typeof obj.skillName !== "string") throw new Error("namer response missing skillName");
-  return {
-    skillName: obj.skillName,
-    description: obj.description ?? "",
-    paramNames: obj.paramNames ?? {},
-  };
-}
+import { monolithSegmenter, validateSegmentation, type Segmentation, type Segmenter } from "./segment.js";
+import type { FlowSkill, Skill, SkillParam, SkillPostCondition, SkillSource, SkillStep } from "./skill.types.js";
 
 export interface CompileInput {
   events: RunEvent[];
@@ -91,44 +10,97 @@ export interface CompileInput {
   model: string;
   client?: string;
   metaStatus?: string;
-  namer: Namer;
+  segmenter: Segmenter;
 }
 
-/** Compiles one run's events into a parameterized, verifiable Skill. */
-export async function compileRun(input: CompileInput): Promise<Skill> {
+export interface CompileResult {
+  /** One primitive skill per segment, in trajectory order. */
+  primitives: Skill[];
+  /** The composed flow chaining the primitives; null when there is only one segment. */
+  flow: FlowSkill | null;
+  /** System quirks the segmenter observed, for the client playbook. */
+  playbookNotes: string[];
+  /** Set when the LLM segmentation was rejected and the monolith fallback was used. */
+  fallbackReason?: string;
+}
+
+/**
+ * Compiles one run's events into parameterized, verifiable skills.
+ *
+ * The detected `literals` are the sole source of truth for what gets
+ * substituted; the segmenter only supplies display names (its paramNames keys
+ * are validated to be a subset of the literals). Building the mapping from
+ * `literals` means an over-eager segmenter can't inject unintended
+ * replacements into the args, and guarantees `params` and the substituted
+ * steps stay consistent.
+ *
+ * A segmentation that fails validation is never "partially" trusted: the
+ * whole proposal is discarded for the deterministic monolith. A worse library
+ * entry, never a wrong one.
+ */
+export async function compileRun(input: CompileInput): Promise<CompileResult> {
   assertCompilable(input.events, input.metaStatus);
   const { steps, postCondition } = extractTrajectory(input.events);
-
   const literals = detectLiterals(input.task, steps, postCondition);
-  const naming = await input.namer({ task: input.task, steps, postCondition, literals });
 
-  // The detected `literals` are the sole source of truth for what gets
-  // substituted; the namer only supplies display names. Building the map from
-  // `literals` (not from `naming.paramNames`) means an over-eager namer that
-  // returns extra/renamed keys can't inject unintended replacements into the
-  // args, and guarantees `params` and the substituted steps stay consistent.
-  const nameFor = (lit: string): string => naming.paramNames[lit] ?? lit;
-  const paramNames: Record<string, string> = Object.fromEntries(literals.map((lit) => [lit, nameFor(lit)]));
+  let seg: Segmentation;
+  let fallbackReason: string | undefined;
+  try {
+    seg = await input.segmenter({ task: input.task, steps, literals });
+    validateSegmentation(seg, steps.length, literals);
+  } catch (err) {
+    fallbackReason = err instanceof Error ? err.message : String(err);
+    seg = await monolithSegmenter({ task: input.task, steps, literals });
+    validateSegmentation(seg, steps.length, literals); // monolith is deterministic; this is a self-check
+  }
 
-  const substituted = parameterize(steps, postCondition, paramNames);
+  const nameFor = (lit: string): string => seg.paramNames[lit] ?? `param${literals.indexOf(lit) + 1}`;
+  const mapping = buildMapping(Object.fromEntries(literals.map((lit) => [lit, nameFor(lit)])));
 
-  const params: SkillParam[] = literals.map((lit) => ({
-    name: nameFor(lit),
-    example: lit,
-  }));
+  const substitutedSteps: SkillStep[] = steps.map((s) => parameterizeStep(s, mapping));
+  const finalPost = parameterizePostCondition(postCondition, mapping);
 
-  return {
-    name: naming.skillName,
-    ...(input.client ? { client: input.client } : {}),
-    description: naming.description,
-    params,
-    steps: substituted.steps,
-    postCondition: substituted.postCondition,
-    source: {
-      runId: input.runId,
-      task: input.task,
-      model: input.model,
-      compiledAt: new Date().toISOString(),
-    },
+  const source: SkillSource = {
+    runId: input.runId,
+    task: input.task,
+    model: input.model,
+    compiledAt: new Date().toISOString(),
   };
+
+  const paramsUsedIn = (json: string): SkillParam[] =>
+    literals.filter((lit) => json.includes(`{{${nameFor(lit)}}}`)).map((lit) => ({ name: nameFor(lit), example: lit }));
+
+  const primitives: Skill[] = seg.segments.map((spec, i) => {
+    const segSteps = substitutedSteps.slice(spec.firstStep, spec.lastStep + 1);
+    const isLast = i === seg.segments.length - 1;
+    const post: SkillPostCondition = isLast ? finalPost : parameterizePostCondition(spec.postCondition!, mapping);
+    return {
+      kind: "primitive" as const,
+      name: spec.name,
+      ...(input.client ? { client: input.client } : {}),
+      description: spec.description,
+      params: paramsUsedIn(JSON.stringify([segSteps, post])),
+      steps: segSteps,
+      postCondition: post,
+      source,
+    };
+  });
+
+  let flow: FlowSkill | null = null;
+  if (primitives.length > 1) {
+    flow = {
+      kind: "flow",
+      name: seg.flowName,
+      ...(input.client ? { client: input.client } : {}),
+      description: seg.flowDescription,
+      params: paramsUsedIn(JSON.stringify(primitives.map((p) => [p.steps, p.postCondition]))),
+      calls: primitives.map((p) => ({
+        skill: p.name,
+        params: Object.fromEntries(p.params.map((param) => [param.name, `{{${param.name}}}`])),
+      })),
+      source,
+    };
+  }
+
+  return { primitives, flow, playbookNotes: seg.playbookNotes, ...(fallbackReason ? { fallbackReason } : {}) };
 }

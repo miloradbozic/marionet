@@ -5,6 +5,7 @@ import { chromium, type Browser, type Page } from "playwright";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { buildSnapshot, renderSnapshot, refSelector, REF_MISS_HINT } from "./snapshot.js";
+import { DESCRIBE_ELEMENT_SRC, describeBySelector, targetSuffix, type ElementIdentity } from "./identity.js";
 
 // Never launches its own browser -- always attaches over CDP to a browser the
 // human started and authenticated manually. Re-triggering an automated login
@@ -52,6 +53,21 @@ async function getPage(): Promise<Page> {
 function errorResult(err: unknown) {
   const message = err instanceof Error ? err.message : String(err);
   return { content: [{ type: "text" as const, text: `Error: ${message}` }], isError: true };
+}
+
+// Playwright's getByRole() accepts a fixed union of ARIA roles; this widens a
+// runtime string into that parameter type after we've decided to trust it.
+type AriaRole = Parameters<Page["getByRole"]>[0];
+
+/**
+ * Resolves an element-targeting tool's arguments to a Playwright-actionable
+ * handle. Two addressing modes:
+ *   - `selector` (CSS)      -- what the model uses during exploration
+ *   - `role` + `name` (semantic) -- what compiled skills use during replay,
+ *     because role + accessible name survive redeploys that churn CSS classes.
+ */
+function semanticLocator(p: Page, role: string, name: string) {
+  return p.getByRole(role as AriaRole, { name, exact: true }).first();
 }
 
 // Human-like "wait for the page to stop changing" before returning control.
@@ -147,9 +163,10 @@ server.registerTool(
       if ((await p.locator(selector).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
+      const identity = await describeBySelector(p, selector);
       await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
       await settle(p);
-      return { content: [{ type: "text" as const, text: `Clicked ${ref}` }] };
+      return { content: [{ type: "text" as const, text: `Clicked ${ref}${targetSuffix(identity)}` }] };
     } catch (err) {
       return errorResult(err);
     }
@@ -186,11 +203,12 @@ server.registerTool(
         var hit = matches[0];
         if (!hit) return null;
         var target = hit.closest("tr") || hit.closest("a,button,[role=button],[role=link]") || hit;
+        var sem = (${DESCRIBE_ELEMENT_SRC})(target);
         try { target.scrollIntoView({ block: "center" }); } catch (e) {}
         target.click();
-        return { tag: target.tagName, text: norm(target.textContent).slice(0, 80) };
+        return { tag: target.tagName, text: norm(target.textContent).slice(0, 80), sem: sem };
       })()`;
-      const clicked = (await p.evaluate(expr)) as { tag: string; text: string } | null;
+      const clicked = (await p.evaluate(expr)) as { tag: string; text: string; sem: ElementIdentity | null } | null;
       if (!clicked) {
         return {
           content: [{ type: "text" as const, text: `No element found containing text "${text}".` }],
@@ -203,7 +221,9 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `Clicked ${clicked.tag} "${clicked.text}"` + (navigated ? ` — navigated to ${p.url()}` : " — page did not navigate"),
+            text:
+              `Clicked ${clicked.tag} "${clicked.text}"${targetSuffix(clicked.sem)}` +
+              (navigated ? ` — navigated to ${p.url()}` : " — page did not navigate"),
           },
         ],
       };
@@ -230,9 +250,10 @@ server.registerTool(
       if ((await p.locator(selector).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
+      const identity = await describeBySelector(p, selector);
       await p.fill(selector, value, { timeout: ACTION_TIMEOUT_MS });
       await settle(p);
-      return { content: [{ type: "text" as const, text: `Filled ${ref} with "${value}"` }] };
+      return { content: [{ type: "text" as const, text: `Filled ${ref} with "${value}"${targetSuffix(identity)}` }] };
     } catch (err) {
       return errorResult(err);
     }
@@ -242,15 +263,29 @@ server.registerTool(
 server.registerTool(
   "browser__click",
   {
-    description: "Click an element on the current page identified by a CSS selector.",
-    inputSchema: { selector: z.string() },
+    description:
+      "Click an element on the current page. Target it with a CSS `selector`, or semantically with ARIA `role` + accessible `name` (as reported by browser__snapshot lines / [target: ...] suffixes) -- semantic targeting survives redeploys that change CSS class names.",
+    inputSchema: {
+      selector: z.string().optional().describe("CSS selector"),
+      role: z.string().optional().describe("ARIA role, e.g. 'button' (use with name)"),
+      name: z.string().optional().describe("Accessible name, e.g. 'Save' (use with role)"),
+    },
   },
-  async ({ selector }) => {
+  async ({ selector, role, name }) => {
     try {
       const p = await getPage();
-      await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
-      await settle(p);
-      return { content: [{ type: "text" as const, text: `Clicked ${selector}` }] };
+      if (selector) {
+        const identity = await describeBySelector(p, selector);
+        await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
+        await settle(p);
+        return { content: [{ type: "text" as const, text: `Clicked ${selector}${targetSuffix(identity)}` }] };
+      }
+      if (role && name) {
+        await semanticLocator(p, role, name).click({ timeout: ACTION_TIMEOUT_MS });
+        await settle(p);
+        return { content: [{ type: "text" as const, text: `Clicked ${role} "${name}"` }] };
+      }
+      return { content: [{ type: "text" as const, text: "Error: provide selector, or role + name" }], isError: true };
     } catch (err) {
       return errorResult(err);
     }
@@ -310,15 +345,30 @@ server.registerTool(
 server.registerTool(
   "browser__fill",
   {
-    description: "Fill a text input or textarea with a value. Use for form fields, search boxes, etc.",
-    inputSchema: { selector: z.string(), value: z.string() },
+    description:
+      "Fill a text input or textarea with a value. Use for form fields, search boxes, etc. Target with a CSS `selector`, or semantically with ARIA `role` + accessible `name` -- semantic targeting survives redeploys that change CSS class names.",
+    inputSchema: {
+      selector: z.string().optional().describe("CSS selector"),
+      value: z.string(),
+      role: z.string().optional().describe("ARIA role, e.g. 'textbox' (use with name)"),
+      name: z.string().optional().describe("Accessible name (use with role)"),
+    },
   },
-  async ({ selector, value }) => {
+  async ({ selector, value, role, name }) => {
     try {
       const p = await getPage();
-      await p.fill(selector, value, { timeout: ACTION_TIMEOUT_MS });
-      await settle(p);
-      return { content: [{ type: "text" as const, text: `Filled ${selector} with "${value}"` }] };
+      if (selector) {
+        const identity = await describeBySelector(p, selector);
+        await p.fill(selector, value, { timeout: ACTION_TIMEOUT_MS });
+        await settle(p);
+        return { content: [{ type: "text" as const, text: `Filled ${selector} with "${value}"${targetSuffix(identity)}` }] };
+      }
+      if (role && name) {
+        await semanticLocator(p, role, name).fill(value, { timeout: ACTION_TIMEOUT_MS });
+        await settle(p);
+        return { content: [{ type: "text" as const, text: `Filled ${role} "${name}" with "${value}"` }] };
+      }
+      return { content: [{ type: "text" as const, text: "Error: provide selector, or role + name" }], isError: true };
     } catch (err) {
       return errorResult(err);
     }
@@ -338,13 +388,17 @@ server.registerTool(
   async ({ key, selector }) => {
     try {
       const p = await getPage();
+      let identity: ElementIdentity | null = null;
       if (selector) {
+        identity = await describeBySelector(p, selector);
         await p.press(selector, key, { timeout: ACTION_TIMEOUT_MS });
       } else {
         await p.keyboard.press(key);
       }
       await settle(p);
-      return { content: [{ type: "text" as const, text: `Pressed ${key}${selector ? ` on ${selector}` : ""}` }] };
+      return {
+        content: [{ type: "text" as const, text: `Pressed ${key}${selector ? ` on ${selector}${targetSuffix(identity)}` : ""}` }],
+      };
     } catch (err) {
       return errorResult(err);
     }
@@ -376,9 +430,10 @@ server.registerTool(
       if (ref && (await p.locator(target).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
+      const identity = await describeBySelector(p, target);
       await p.fill(target, value, { timeout: ACTION_TIMEOUT_MS });
       await settle(p);
-      return { content: [{ type: "text" as const, text: `Filled ${ref ?? selector} from env var ${env_var}` }] };
+      return { content: [{ type: "text" as const, text: `Filled ${ref ?? selector} from env var ${env_var}${targetSuffix(identity)}` }] };
     } catch (err) {
       return errorResult(err);
     }
@@ -437,11 +492,12 @@ server.registerTool(
   async ({ selector, option }) => {
     try {
       const p = await getPage();
+      const identity = await describeBySelector(p, selector);
       await p.selectOption(selector, { label: option }, { timeout: ACTION_TIMEOUT_MS }).catch(
         () => p.selectOption(selector, { value: option }, { timeout: ACTION_TIMEOUT_MS }),
       );
       await settle(p);
-      return { content: [{ type: "text" as const, text: `Selected "${option}" in ${selector}` }] };
+      return { content: [{ type: "text" as const, text: `Selected "${option}" in ${selector}${targetSuffix(identity)}` }] };
     } catch (err) {
       return errorResult(err);
     }

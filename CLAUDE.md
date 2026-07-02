@@ -69,16 +69,18 @@ Both servers are in `mcp-servers/` and are separate npm workspaces (`mcp-servers
 
 ### Trajectory compiler (`src/compiler/`)
 
-Turns a successful, verified run into a reusable **skill** — the "learn once, replay cheap" half of the roadmap (Phase 4). `marionet compile <run-id>` reads that run's `events.jsonl` + `meta.json` and emits `clients/<client>/skills/<name>.json`.
+Turns a successful, verified run into reusable **skills** — the "learn once, replay cheap" half of the roadmap (Phase 4). `marionet compile <run-id>` reads that run's `events.jsonl` + `meta.json` and emits one `clients/<client>/skills/<name>.json` per segment plus a composed **flow** skill that chains them.
 
 Pipeline (`compileRun` in `compile.ts`):
 1. `assertCompilable` — refuse unless `meta.status === "success"`, `finish_task` was `success`, and a `verification` event matched. A skill you can't trust is worse than none.
-2. `extractTrajectory` (`trajectory.ts`) — reduce events to the executed, non-errored tool calls (steps) and lift the passing verification into a `postCondition`. Drops a trailing step that merely re-reads the post-condition value (the model often double-checks before finishing).
+2. `extractTrajectory` (`trajectory.ts`) — reduce events to the executed, non-errored tool calls (steps, each carrying its recorded result text) and lift the passing verification into a `postCondition`. A ` [target: role "name"]` suffix in a result becomes the step's semantic `locator` (browser tools report the acted element's ARIA role + accessible name; see `identity.ts`). Drops a trailing step that merely re-reads the post-condition value.
 3. `detectLiterals` (`parameterize.ts`) — find task tokens that also appear in the step args, restricted to *value-like* literals (quoted strings, or tokens containing a digit). Prose words like `EAN`/`Akeneo` are deliberately skipped: they appear in a search-box value but not in the lowercased/snake_cased selector, so parameterizing them yields a half-substituted, broken skill.
-4. `namer` — names the skill and each param. `llmNamer` does one cheap JSON call (`open_product_by_sku`, `{sku, ean}`); `heuristicNamer` is the offline fallback (`--heuristic`, positional `param1…`).
-5. `parameterize` — replace every literal occurrence with `{{param}}` across steps + post-condition.
+4. `segmenter` (`segment.ts`) — one LLM call proposes segment boundaries, snake_case names, per-segment read-only post-conditions (must hold for *any* params — no run-specific UUIDs), param names, and playbook notes. `validateSegmentation` is the trust boundary: contiguous partition, paramNames ⊆ detected literals, read-only post-condition tools only. Any violation discards the whole proposal for the deterministic `monolithSegmenter` (also used by `--heuristic`).
+5. `parameterize` — replace every literal occurrence with `{{param}}` across steps (args **and** locator names) + post-conditions. Substitution is driven by the detected literals, never by the segmenter's keys.
 
-Skills live under the client (gitignored, like other client data); the committed proof is `test/compiler.test.ts` running against the real `test/fixtures/akeneo-set-ean.events.jsonl`. Phase 5 (`feat/replay`) will execute these steps directly with zero LLM calls on the happy path.
+Segment post-conditions: every segment except the last needs a synthesized structural check (e.g. "the attribute search box exists"); the last segment inherits the run's verified post-condition. `emit.ts` writes the skill files and appends deduped playbook notes to `clients/<client>/playbooks/learned.md`.
+
+Skills live under the client (gitignored, like other client data); the committed proof is `test/compiler.test.ts` running against the real `test/fixtures/akeneo-set-ean.events.jsonl`. Phase 5 (`feat/replay`) executes these steps directly with zero LLM calls on the happy path.
 
 ### Logging (`runs/<run-id>/`)
 
