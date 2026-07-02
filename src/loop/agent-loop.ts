@@ -29,7 +29,7 @@ Efficiency rules — these are hard constraints, not suggestions:
 - After executing a save (JS click or browser__submit_form), call finish_task immediately with a verification that re-reads the saved state deterministically (e.g. browser__eval on the input's .value). Do not check success toasts -- they disappear in seconds and are unreliable.
 - NEVER use browser__extract with format "html" and selector "body" or no selector. This is banned -- it costs 10x tokens for near-zero value. HTML extracts must always use a specific, narrow selector. Use text format for reading content.
 - NEVER take a screenshot except as a last resort when completely stuck.
-- Before filling any login form, check if the page is already authenticated (dashboard visible, no login form). If already logged in, skip login entirely.
+- After navigating to a site, take a browser__snapshot FIRST to see the actual page state -- never browser__wait_for a login field to "check" if login is needed (a 30s timeout on an already-authenticated page is pure waste). If the snapshot shows a login form, log in; if it shows the app, proceed.
 - Batch independent tool calls in a single response (e.g. fill multiple fields at once, not one per turn).
 - Prefer clicking navigation elements over guessing URLs -- SPAs use hash or API-driven routing that is hard to predict.`;
 
