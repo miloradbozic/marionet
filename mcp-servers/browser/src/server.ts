@@ -220,6 +220,31 @@ server.registerTool(
 );
 
 server.registerTool(
+  "browser__press",
+  {
+    description:
+      "Press a keyboard key, optionally after focusing a field. Use this to submit a search box or form that only reacts to Enter (browser__fill sets a value but sends no keystrokes, so debounced/keyboard-driven searches never fire). Key names follow Playwright: 'Enter', 'Escape', 'Tab', 'ArrowDown', etc. If selector is given the field is focused (clicked) first; otherwise the key goes to the currently focused element.",
+    inputSchema: {
+      key: z.string().describe("Key to press, e.g. 'Enter'"),
+      selector: z.string().optional().describe("CSS selector to focus before pressing (optional)"),
+    },
+  },
+  async ({ key, selector }) => {
+    try {
+      const p = await getPage();
+      if (selector) {
+        await p.press(selector, key, { timeout: 15_000 });
+      } else {
+        await p.keyboard.press(key);
+      }
+      return { content: [{ type: "text" as const, text: `Pressed ${key}${selector ? ` on ${selector}` : ""}` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
   "browser__fill_from_env",
   {
     description:

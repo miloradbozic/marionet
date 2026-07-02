@@ -59,6 +59,7 @@ Both servers are in `mcp-servers/` and are separate npm workspaces (`mcp-servers
 - `browser__click_ref` / `browser__fill_ref` — act on snapshot refs instead of guessed CSS selectors. `browser__fill_from_env` also accepts a `ref`.
 - `browser__fill_from_env` — fills an input from a named env var; the secret value never reaches the model. Use this instead of `browser__fill` for passwords/API keys.
 - `browser__submit_form` — finds `[type=submit]` within the given selector and clicks it. Works for standard HTML forms; does **not** work for JS-driven forms with no native submit button, or submit buttons outside the `<form>` tag (use `browser__click` directly in those cases). If broadening: consider an explicit `submitSelector` param.
+- `browser__press` — presses a keyboard key (e.g. `Enter`), optionally after focusing a selector. Needed because `browser__fill` sets a value and fires only an `input` event — it sends no keystrokes, so debounced or Enter-to-submit search boxes (e.g. the Akeneo product grid) never fire on fill alone.
 
 ### Logging (`runs/<run-id>/`)
 
