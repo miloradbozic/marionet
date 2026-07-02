@@ -36,6 +36,11 @@ function toolCall(id: string, name: string, input: unknown): OpenAI.ChatCompleti
   return { id, type: "function", function: { name, arguments: JSON.stringify(input) } };
 }
 
+/** A tool call whose arguments are a raw (possibly malformed) JSON string. */
+function rawToolCall(id: string, name: string, rawArgs: string): OpenAI.ChatCompletionMessageToolCall {
+  return { id, type: "function", function: { name, arguments: rawArgs } };
+}
+
 const PASSING_VERIFICATION = { tool: "fs__read", args: { path: "out.txt" }, expectPattern: "ok" };
 
 function finishTaskCompletion(
@@ -254,6 +259,29 @@ describe("runAgentLoop", () => {
     const finalMessages = (create.mock.calls[3]![0] as OpenAI.ChatCompletionCreateParamsNonStreaming).messages;
     expect(String(finalMessages[7]!.content)).toMatch(/failed every time/); // 3rd failure escalated
     expect(String(finalMessages[3]!.content)).not.toMatch(/failed every time/); // 1st failure not
+  });
+
+  it("does not crash on a tool call with malformed JSON arguments; surfaces a recoverable error", async () => {
+    const create = vi
+      .fn()
+      // Arguments string is invalid JSON (unterminated) -- must not throw.
+      .mockResolvedValueOnce(makeCompletion(null, [rawToolCall("tc_bad", "browser__eval", '{"expression": "foo(\\"}')]))
+      .mockResolvedValueOnce(finishTaskCompletion("success", "Recovered.", PASSING_VERIFICATION));
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });
+
+    const result = await runAgentLoop(
+      baseOptions({
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
+        mcpClientManager: fakeMcpManager(callTool),
+      }),
+    );
+
+    expect(result.status).toBe("success");
+    // The malformed call was never executed...
+    expect(callTool).not.toHaveBeenCalledWith("browser__eval", expect.anything());
+    // ...and the model got an error tool result telling it the args were invalid.
+    const secondCallArgs = create.mock.calls[1]![0] as OpenAI.ChatCompletionCreateParamsNonStreaming;
+    expect(String(secondCallArgs.messages[3]!.content)).toMatch(/not valid JSON/);
   });
 
   it("nudges a model that responds with no tool call, and eventually halts if it never recovers", async () => {

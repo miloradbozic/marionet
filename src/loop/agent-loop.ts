@@ -38,6 +38,22 @@ Efficiency rules — these are hard constraints, not suggestions:
 /** How many identical failing tool calls before the loop guard escalates. */
 const REPEAT_FAILURE_LIMIT = 3;
 
+/**
+ * Tool-call arguments arrive as a JSON string the model generated, so they can
+ * be malformed (unescaped quotes/newlines in a JS expression are the usual
+ * culprit). A single bad tool call must never crash the whole run -- parse
+ * defensively and turn a parse failure into a recoverable error for the model.
+ */
+function safeParseArgs(
+  raw: string,
+): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  try {
+    return { ok: true, value: (JSON.parse(raw) as Record<string, unknown>) ?? {} };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 /** Minimal surface the loop needs -- lets tests inject a fake. */
 export interface LlmMessagesClient {
   chat: {
@@ -190,11 +206,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       type: "model_response",
       stopReason: choice.finish_reason,
       text: text || undefined,
-      toolUses: toolCalls.map((tc) => ({
-        id: tc.id,
-        name: tc.function.name,
-        input: JSON.parse(tc.function.arguments) as Record<string, unknown>,
-      })),
+      toolUses: toolCalls.map((tc) => {
+        const parsed = safeParseArgs(tc.function.arguments);
+        return {
+          id: tc.id,
+          name: tc.function.name,
+          input: parsed.ok ? parsed.value : { _unparsed: tc.function.arguments, _parseError: parsed.error },
+        };
+      }),
       usage: { input_tokens: inputTokens, output_tokens: outputTokens },
     });
 
@@ -219,7 +238,24 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 
     for (const tc of toolCalls) {
       const name = tc.function.name;
-      const args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+      const parsed = safeParseArgs(tc.function.arguments);
+      if (!parsed.ok) {
+        opts.logger.log({
+          type: "tool_result",
+          toolUseId: tc.id,
+          tool: name,
+          isError: true,
+          durationMs: 0,
+          content: [{ type: "text", text: `Invalid JSON arguments: ${parsed.error}` }],
+        });
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: `Your ${name} call arguments were not valid JSON (${parsed.error}). Re-send the call with correctly escaped JSON -- if a value contains quotes, newlines, or backslashes (e.g. a JS expression for browser__eval), escape them properly, or prefer a dedicated tool like browser__click_text so you don't have to hand-write JS.`,
+        });
+        continue;
+      }
+      const args = parsed.value;
 
       if (name === FINISH_TASK_TOOL_NAME) {
         const input = args as unknown as FinishTaskInput;
