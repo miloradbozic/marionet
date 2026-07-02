@@ -12,6 +12,11 @@ import { compileRun } from "./compiler/compile.js";
 import { llmSegmenter, monolithSegmenter, type Segmenter } from "./compiler/segment.js";
 import { parseEvents } from "./compiler/trajectory.js";
 import { writeSkillFiles, appendPlaybookNotes } from "./compiler/emit.js";
+import { SkillStore } from "./replay/skill-store.js";
+import { replaySkill } from "./replay/replay-engine.js";
+import { llmHealer, type Healer } from "./replay/heal.js";
+import type { SkillRunner } from "./loop/run-skill-tool.js";
+import { isFlowSkill } from "./compiler/skill.types.js";
 import {
   filterEnvForClient,
   loadClientProfile,
@@ -50,7 +55,13 @@ async function ensureChrome(cdpEndpoint: string): Promise<void> {
 const USAGE =
   'Usage: marionet run [--client <name>] "<task>"\n' +
   "       marionet transcript [run-id]\n" +
-  "       marionet compile [run-id] [--heuristic]";
+  "       marionet compile [run-id] [--heuristic]\n" +
+  "       marionet replay [--client <name>] <skill> [--param k=v ...] [--csv <file>] [--no-heal]\n" +
+  "       marionet skills [--client <name>]";
+
+function skillsDirFor(repoRoot: string, clientName: string | undefined): string {
+  return clientName ? path.join(repoRoot, "clients", clientName, "skills") : path.join(repoRoot, "workspace", "skills");
+}
 
 async function runCommand(repoRoot: string, task: string, clientName: string | undefined): Promise<void> {
   const runConfig = loadRunConfig(path.join(repoRoot, "config", "run.config.json"));
@@ -85,6 +96,20 @@ async function runCommand(repoRoot: string, task: string, clientName: string | u
 
   const { client: llmClient, effectiveModel } = createLlmClient(runConfig.model);
 
+  // Compiled skills become a run_skill tool: the agent can execute a
+  // known-good flow in one call instead of rediscovering it step by step.
+  const store = new SkillStore(skillsDirFor(repoRoot, profile?.name));
+  const skillRunner: SkillRunner | undefined = store.listNames().length
+    ? {
+        available: () => store.list().map((s) => ({ name: s.name, description: s.description, params: s.params })),
+        run: async (name, params) => {
+          const r = await replaySkill(name, params, { store, mcp: mcpClientManager, policy, logger });
+          return { status: r.status, summary: r.summary };
+        },
+      }
+    : undefined;
+  if (skillRunner) console.log(`skills: ${store.listNames().join(", ")}`);
+
   let exitCode = 1;
   try {
     const result = await runAgentLoop({
@@ -100,6 +125,7 @@ async function runCommand(repoRoot: string, task: string, clientName: string | u
       mcpClientManager,
       policy,
       logger,
+      skillRunner,
     });
 
     logger.finalize(result.status);
@@ -215,6 +241,136 @@ async function compileCommand(repoRoot: string, runId: string | undefined, useHe
   }
 }
 
+/** Minimal CSV: first row = param names; commas split cells; surrounding quotes stripped. */
+function parseCsv(filePath: string): Array<Record<string, string>> {
+  const lines = readFileSync(filePath, "utf-8")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length < 2) throw new Error(`CSV ${filePath} needs a header row and at least one data row`);
+  const unquote = (s: string) => s.trim().replace(/^"(.*)"$/, "$1");
+  const header = lines[0]!.split(",").map(unquote);
+  return lines.slice(1).map((line) => {
+    const cells = line.split(",").map(unquote);
+    return Object.fromEntries(header.map((h, i) => [h, cells[i] ?? ""]));
+  });
+}
+
+interface ReplayCliArgs {
+  skillName: string;
+  clientName?: string;
+  params: Record<string, string>;
+  csvPath?: string;
+  noHeal: boolean;
+}
+
+function parseReplayArgs(rest: string[]): ReplayCliArgs {
+  const out: ReplayCliArgs = { skillName: "", params: {}, noHeal: false };
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a === "--client") {
+      out.clientName = rest[++i];
+      if (!out.clientName) throw new Error("--client requires a name");
+    } else if (a === "--param") {
+      const kv = rest[++i];
+      const eq = kv?.indexOf("=") ?? -1;
+      if (!kv || eq < 1) throw new Error("--param requires k=v");
+      out.params[kv.slice(0, eq)] = kv.slice(eq + 1);
+    } else if (a === "--csv") {
+      out.csvPath = rest[++i];
+      if (!out.csvPath) throw new Error("--csv requires a file path");
+    } else if (a === "--no-heal") {
+      out.noHeal = true;
+    } else if (!out.skillName) {
+      out.skillName = a;
+    } else {
+      throw new Error(`unexpected argument "${a}"`);
+    }
+  }
+  if (!out.skillName) throw new Error("replay requires a skill name");
+  return out;
+}
+
+async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<void> {
+  const runConfig = loadRunConfig(path.join(repoRoot, "config", "run.config.json"));
+  const profile: ClientProfile | undefined = cliArgs.clientName ? loadClientProfile(repoRoot, cliArgs.clientName) : undefined;
+  const policy = new PolicyEngine(path.join(repoRoot, "config", "policy.json5"), profile?.policyPath);
+  const store = new SkillStore(skillsDirFor(repoRoot, profile?.name));
+
+  await ensureChrome(runConfig.browser.cdpEndpoint);
+  mkdirSync(path.join(repoRoot, "runs"), { recursive: true });
+  mkdirSync(path.join(repoRoot, "workspace"), { recursive: true });
+
+  let healer: Healer | undefined;
+  let healModel = "(no heal)";
+  if (!cliArgs.noHeal) {
+    try {
+      const model = runConfig.models?.heal ?? runConfig.model;
+      const { client, effectiveModel } = createLlmClient(model);
+      healer = llmHealer(client, effectiveModel);
+      healModel = model;
+    } catch (err) {
+      console.warn(`(self-heal unavailable: ${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+
+  const rows: Array<Record<string, string>> = cliArgs.csvPath
+    ? parseCsv(cliArgs.csvPath).map((row) => ({ ...cliArgs.params, ...row }))
+    : [cliArgs.params];
+
+  const logger = new RunLogger(path.join(repoRoot, "runs"), {
+    task: `replay ${cliArgs.skillName}${cliArgs.csvPath ? ` --csv ${cliArgs.csvPath} (${rows.length} rows)` : ` ${JSON.stringify(cliArgs.params)}`}`,
+    client: profile?.name,
+    model: `replay (heal: ${healModel})`,
+    maxTurns: 0,
+    maxCostUsd: 0,
+    policySnapshot: policy.snapshot,
+    policySourcePath: policy.sourcePath,
+  });
+  console.log(`marionet replay ${logger.runId}`);
+  console.log(`skill: ${cliArgs.skillName}${profile ? `  client: ${profile.name}` : ""}`);
+
+  const mcp = await McpClientManager.connectAll(
+    runConfig.mcpServers,
+    repoRoot,
+    runConfig.browser.cdpEndpoint,
+    filterEnvForClient(process.env, profile),
+  );
+
+  let failures = 0;
+  try {
+    for (const [i, params] of rows.entries()) {
+      if (rows.length > 1) console.log(`\n--- row ${i + 1}/${rows.length}: ${JSON.stringify(params)}`);
+      const r = await replaySkill(cliArgs.skillName, params, { store, mcp, policy, logger, healer });
+      if (r.status !== "success") failures++;
+      console.log(`${r.status === "success" ? "ok " : "FAIL"} ${r.summary}`);
+    }
+  } finally {
+    const status = failures === 0 ? "success" : "failure";
+    logger.finalize(status);
+    if (rows.length > 1) console.log(`\n${rows.length - failures}/${rows.length} rows succeeded`);
+    console.log(`log: ${logger.runDir}`);
+    await mcp.closeAll();
+    process.exit(failures === 0 ? 0 : 1);
+  }
+}
+
+function skillsCommand(repoRoot: string, clientName: string | undefined): void {
+  const store = new SkillStore(skillsDirFor(repoRoot, clientName));
+  const skills = store.list();
+  if (!skills.length) {
+    console.log(`No skills in ${store.skillsDir}. Compile a successful run first: marionet compile [run-id]`);
+    return;
+  }
+  for (const s of skills) {
+    const kind = isFlowSkill(s) ? "flow     " : "primitive";
+    const params = s.params.map((p) => `${p.name}=${p.example}`).join(", ");
+    console.log(`${kind}  ${s.name}(${params})`);
+    console.log(`           ${s.description}`);
+    if (isFlowSkill(s)) console.log(`           calls: ${s.calls.map((c) => c.skill).join(" -> ")}`);
+  }
+}
+
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   const repoRoot = process.cwd();
@@ -228,6 +384,17 @@ async function main(): Promise<void> {
     const useHeuristic = rest.includes("--heuristic");
     const runId = rest.find((a) => a !== "--heuristic");
     await compileCommand(repoRoot, runId, useHeuristic);
+    return;
+  }
+
+  if (command === "replay") {
+    await replayCommand(repoRoot, parseReplayArgs(rest));
+    return;
+  }
+
+  if (command === "skills") {
+    const clientIdx = rest.indexOf("--client");
+    skillsCommand(repoRoot, clientIdx >= 0 ? rest[clientIdx + 1] : undefined);
     return;
   }
 

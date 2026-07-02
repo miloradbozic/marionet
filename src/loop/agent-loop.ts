@@ -5,6 +5,7 @@ import type { PolicyEngine } from "../policy/policy-engine.js";
 import { confirmToolCall } from "../confirm/cli-prompt.js";
 import type { RunLogger } from "../logging/run-logger.js";
 import { FINISH_TASK_TOOL, FINISH_TASK_TOOL_NAME, type FinishTaskInput } from "./finish-task-tool.js";
+import { buildRunSkillTool, RUN_SKILL_TOOL_NAME, type SkillRunner } from "./run-skill-tool.js";
 import { mcpResultToToolContent } from "./message-mapper.js";
 
 const SYSTEM_PROMPT = `/no_think
@@ -77,6 +78,8 @@ export interface AgentLoopOptions {
   mcpClientManager: McpClientManager;
   policy: PolicyEngine;
   logger: RunLogger;
+  /** When set (and non-empty), the model gets a run_skill tool to execute compiled skills. */
+  skillRunner?: SkillRunner;
 }
 
 export interface AgentLoopResult {
@@ -159,7 +162,12 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     { role: "system", content: systemPrompt },
     { role: "user", content: opts.task },
   ];
-  const tools: OpenAI.ChatCompletionTool[] = [...opts.mcpClientManager.tools, FINISH_TASK_TOOL];
+  const availableSkills = opts.skillRunner?.available() ?? [];
+  const tools: OpenAI.ChatCompletionTool[] = [
+    ...opts.mcpClientManager.tools,
+    FINISH_TASK_TOOL,
+    ...(availableSkills.length ? [buildRunSkillTool(availableSkills)] : []),
+  ];
 
   let totalCostUsd = 0;
   let iter = 0;
@@ -272,6 +280,34 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         opts.logger.log({ type: "finish_task", status: input.status, summary: input.summary, details: input.details });
         finishResult = { status: input.status, summary: input.summary, details: input.details };
         messages.push({ role: "tool", tool_call_id: tc.id, content: "Task finished." });
+        continue;
+      }
+
+      if (name === RUN_SKILL_TOOL_NAME && opts.skillRunner) {
+        // Meta-tool: the replay engine policy-gates and logs every underlying
+        // step itself, so there is no separate policy decision for the wrapper.
+        const skillName = String(args.skill ?? "");
+        const skillParams = (args.params ?? {}) as Record<string, string>;
+        const start = Date.now();
+        let content: string;
+        let isError: boolean;
+        try {
+          const result = await opts.skillRunner.run(skillName, skillParams);
+          isError = result.status !== "success";
+          content = `run_skill ${skillName}: ${result.status} -- ${result.summary}`;
+        } catch (err) {
+          isError = true;
+          content = `run_skill ${skillName} failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        opts.logger.log({
+          type: "tool_result",
+          toolUseId: tc.id,
+          tool: name,
+          isError,
+          durationMs: Date.now() - start,
+          content: [{ type: "text", text: content }],
+        });
+        messages.push({ role: "tool", tool_call_id: tc.id, content });
         continue;
       }
 

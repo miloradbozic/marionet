@@ -8,6 +8,8 @@ export interface McpServerConfig {
 
 export interface RunConfig {
   model: string;
+  /** Per-phase model overrides; heal is used by replay self-heal (falls back to model). */
+  models?: { heal?: string };
   maxTokens: number;
   maxTurns: number;
   maxCostUsd: number;
