@@ -13,6 +13,13 @@ import { buildSnapshot, renderSnapshot, refSelector, REF_MISS_HINT } from "./sna
 const CDP_ENDPOINT = process.env.MARIONET_BROWSER_CDP_ENDPOINT ?? "http://localhost:9222";
 const WORKSPACE_ROOT = path.resolve(process.cwd(), "workspace");
 
+// Timeout for a single element action (click/fill/press/select). With
+// auto-settle (see settle()) the page has stopped changing before we act, so
+// an element that still isn't actionable within this window almost always
+// means the WRONG selector, not a slow one -- fail fast and let the model
+// re-perceive rather than burning 15s per miss.
+const ACTION_TIMEOUT_MS = 6_000;
+
 let browser: Browser | undefined;
 let page: Page | undefined;
 const hookedContexts = new WeakSet<ReturnType<Browser["contexts"]>[number]>();
@@ -140,7 +147,7 @@ server.registerTool(
       if ((await p.locator(selector).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
-      await p.click(selector, { timeout: 15_000 });
+      await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
       await settle(p);
       return { content: [{ type: "text" as const, text: `Clicked ${ref}` }] };
     } catch (err) {
@@ -166,7 +173,7 @@ server.registerTool(
       if ((await p.locator(selector).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
-      await p.fill(selector, value, { timeout: 15_000 });
+      await p.fill(selector, value, { timeout: ACTION_TIMEOUT_MS });
       await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${ref} with "${value}"` }] };
     } catch (err) {
@@ -184,7 +191,7 @@ server.registerTool(
   async ({ selector }) => {
     try {
       const p = await getPage();
-      await p.click(selector, { timeout: 15_000 });
+      await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
       await settle(p);
       return { content: [{ type: "text" as const, text: `Clicked ${selector}` }] };
     } catch (err) {
@@ -252,7 +259,7 @@ server.registerTool(
   async ({ selector, value }) => {
     try {
       const p = await getPage();
-      await p.fill(selector, value, { timeout: 15_000 });
+      await p.fill(selector, value, { timeout: ACTION_TIMEOUT_MS });
       await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${selector} with "${value}"` }] };
     } catch (err) {
@@ -275,7 +282,7 @@ server.registerTool(
     try {
       const p = await getPage();
       if (selector) {
-        await p.press(selector, key, { timeout: 15_000 });
+        await p.press(selector, key, { timeout: ACTION_TIMEOUT_MS });
       } else {
         await p.keyboard.press(key);
       }
@@ -312,7 +319,7 @@ server.registerTool(
       if (ref && (await p.locator(target).count()) === 0) {
         return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
       }
-      await p.fill(target, value, { timeout: 15_000 });
+      await p.fill(target, value, { timeout: ACTION_TIMEOUT_MS });
       await settle(p);
       return { content: [{ type: "text" as const, text: `Filled ${ref ?? selector} from env var ${env_var}` }] };
     } catch (err) {
@@ -373,8 +380,8 @@ server.registerTool(
   async ({ selector, option }) => {
     try {
       const p = await getPage();
-      await p.selectOption(selector, { label: option }, { timeout: 15_000 }).catch(
-        () => p.selectOption(selector, { value: option }, { timeout: 15_000 }),
+      await p.selectOption(selector, { label: option }, { timeout: ACTION_TIMEOUT_MS }).catch(
+        () => p.selectOption(selector, { value: option }, { timeout: ACTION_TIMEOUT_MS }),
       );
       await settle(p);
       return { content: [{ type: "text" as const, text: `Selected "${option}" in ${selector}` }] };
@@ -412,9 +419,9 @@ server.registerTool(
       const submitLocator = p.locator(`${selector} [type=submit]`).first();
       const hasSubmitChild = await submitLocator.count() > 0;
       if (hasSubmitChild) {
-        await submitLocator.click({ timeout: 10_000 });
+        await submitLocator.click({ timeout: ACTION_TIMEOUT_MS });
       } else {
-        await p.click(selector, { timeout: 10_000 });
+        await p.click(selector, { timeout: ACTION_TIMEOUT_MS });
       }
       await settle(p);
       return { content: [{ type: "text" as const, text: `Submitted form via ${selector}` }] };
