@@ -7,12 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 npm run marionet -- run "<task>"                 # run the agent (default profile: full env, no playbooks)
 npm run marionet -- run --client opari "<task>"  # client run: their playbooks injected, env filtered to their vars
+npm run marionet -- last           # one-glance stats for the latest run: duration, cost, LLM turns, replay-or-not
 npm run marionet -- transcript     # render latest run to markdown (useful if run was killed)
 npm run marionet -- transcript <run-id>
 npm run marionet -- compile [run-id]             # compile a successful+verified run into reusable skills
 npm run marionet -- compile [run-id] --heuristic # ...skip the LLM segmentation call (offline, monolithic)
-npm run marionet -- replay --client opari set_ean_for_product --param sku=2002 --param ean=999   # zero-LLM replay
-npm run marionet -- replay --client opari set_ean_for_product --csv rows.csv   # bulk: one replay per CSV row
+npm run marionet -- replay --client opari set_product_ean --param product_id=2002 --param ean=999   # zero-LLM replay
+npm run marionet -- replay --client opari set_product_ean --csv rows.csv   # bulk: one replay per CSV row
 npm run marionet -- skills --client opari        # list the client's compiled skill library
 
 npm run typecheck                  # type-check orchestrator + both MCP workspaces

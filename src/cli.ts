@@ -6,6 +6,7 @@ import { McpClientManager } from "./mcp/mcp-client-manager.js";
 import { PolicyEngine } from "./policy/policy-engine.js";
 import { RunLogger, type RunMeta } from "./logging/run-logger.js";
 import { renderTranscript } from "./logging/transcript-renderer.js";
+import { computeRunStats, renderRunStats } from "./logging/run-stats.js";
 import { runAgentLoop } from "./loop/agent-loop.js";
 import { createLlmClient } from "./llm-client.js";
 import { compileRun } from "./compiler/compile.js";
@@ -54,6 +55,7 @@ async function ensureChrome(cdpEndpoint: string): Promise<void> {
 
 const USAGE =
   'Usage: marionet run [--client <name>] "<task>"\n' +
+  "       marionet last [run-id]        (duration, cost, LLM turns, replay-or-not)\n" +
   "       marionet transcript [run-id]\n" +
   "       marionet compile [run-id] [--heuristic]\n" +
   "       marionet replay [--client <name>] <skill> [--param k=v ...] [--csv <file>] [--no-heal]\n" +
@@ -79,6 +81,7 @@ async function runCommand(repoRoot: string, task: string, clientName: string | u
     model: runConfig.model,
     maxTurns: runConfig.maxTurns,
     maxCostUsd: runConfig.maxCostUsd,
+    pricing: runConfig.pricing,
     policySnapshot: policy.snapshot,
     policySourcePath: policy.sourcePath,
   });
@@ -134,6 +137,8 @@ async function runCommand(repoRoot: string, task: string, clientName: string | u
     console.log(`\nstatus: ${result.status}`);
     console.log(result.summary);
     if (result.details) console.log(result.details);
+    console.log("");
+    console.log(renderRunStats(computeRunStats(logger.runDir)));
     console.log(`\nlog: ${logger.runDir}`);
 
     exitCode = result.status === "success" ? 0 : 1;
@@ -162,6 +167,19 @@ function resolveRunDir(repoRoot: string, runId: string | undefined): string {
   const latest = entries.at(-1);
   if (!latest) throw new Error(`No runs found under ${runsRoot}`);
   return path.join(runsRoot, latest);
+}
+
+function lastCommand(repoRoot: string, runId: string | undefined): void {
+  const runDir = resolveRunDir(repoRoot, runId);
+  // Old runs predate the pricing snapshot in meta.json; fall back to the
+  // currently-configured pricing so their cost is still estimable.
+  let fallbackPricing: { input: number; output: number } | undefined;
+  try {
+    fallbackPricing = loadRunConfig(path.join(repoRoot, "config", "run.config.json")).pricing;
+  } catch {
+    /* no config -- tokens only */
+  }
+  console.log(renderRunStats(computeRunStats(runDir, fallbackPricing)));
 }
 
 function transcriptCommand(repoRoot: string, runId: string | undefined): void {
@@ -324,6 +342,7 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
     model: `replay (heal: ${healModel})`,
     maxTurns: 0,
     maxCostUsd: 0,
+    pricing: runConfig.pricing,
     policySnapshot: policy.snapshot,
     policySourcePath: policy.sourcePath,
   });
@@ -374,6 +393,11 @@ function skillsCommand(repoRoot: string, clientName: string | undefined): void {
 async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   const repoRoot = process.cwd();
+
+  if (command === "last") {
+    lastCommand(repoRoot, rest[0]);
+    return;
+  }
 
   if (command === "transcript") {
     transcriptCommand(repoRoot, rest[0]);

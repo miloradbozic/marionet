@@ -9,6 +9,8 @@ export interface RunMeta {
   model: string;
   maxTurns: number;
   maxCostUsd: number;
+  /** $/MTok at run time, snapshotted so past runs stay costable after config changes. */
+  pricing?: { input: number; output: number };
   policySnapshot: PolicyConfig;
   policySourcePath: string;
   startedAt: string;
@@ -39,6 +41,7 @@ export class RunLogger {
       model: string;
       maxTurns: number;
       maxCostUsd: number;
+      pricing?: { input: number; output: number };
       policySnapshot: PolicyConfig;
       policySourcePath: string;
     },
@@ -57,6 +60,7 @@ export class RunLogger {
       model: opts.model,
       maxTurns: opts.maxTurns,
       maxCostUsd: opts.maxCostUsd,
+      ...(opts.pricing ? { pricing: opts.pricing } : {}),
       policySnapshot: opts.policySnapshot,
       policySourcePath: opts.policySourcePath,
       startedAt: new Date().toISOString(),
