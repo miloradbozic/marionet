@@ -18,8 +18,9 @@ import type { Healer } from "./heal.js";
  *
  * Failure handling: a step whose semantic AND selector attempts both fail
  * wakes the healer (if any) for just that step; a successful patch is written
- * back to the skill file. A post-condition mismatch is not healed -- the
- * engine can't know which earlier step lied -- it fails the replay.
+ * back to the skill file. A post-condition mismatch is retried (the read can
+ * race a slow SPA render) but never healed -- the engine can't know which
+ * earlier step lied -- so a persistent mismatch fails the replay.
  */
 
 export interface ConfirmFn {
@@ -36,6 +37,8 @@ export interface ReplayEngineOptions {
   maxHeals?: number;
   /** Injectable for tests; defaults to the interactive CLI prompt. */
   confirm?: ConfirmFn;
+  /** Delay before each post-condition re-read (default 2000ms; 0 in tests). */
+  postRetryDelayMs?: number;
 }
 
 export interface ReplayOutcome {
@@ -54,6 +57,9 @@ interface PlanEntry {
 }
 
 const MAX_FLOW_DEPTH = 10;
+
+/** Post-condition re-reads after an initial mismatch (read-only, so retrying is safe). */
+const POST_CONDITION_RETRIES = 3;
 
 /** Tools that accept semantic role+name targeting as an alternative to a CSS selector. */
 const SEMANTIC_TOOLS = new Set(["browser__click", "browser__fill"]);
@@ -198,12 +204,22 @@ export async function replaySkill(name: string, params: Record<string, string>, 
       }
 
       // Post-condition: the primitive isn't "done" because its steps ran; it's
-      // done because the read-back check matches.
+      // done because the read-back check matches. Replay moves at machine
+      // speed, so the first read can race an SPA render (a "Loading..."
+      // screen is DOM-quiet, so auto-settle resolves before the real content
+      // arrives) -- on mismatch, re-read with a delay before failing.
       const post = skill.postCondition;
       const postArgs = substituteArgs(post.args, entry.params);
       const pattern = substitutePattern(post.expectPattern, entry.params);
-      const r = await execute(post.tool, postArgs, `${skill.name} postCondition`);
-      const matched = r.ok && new RegExp(pattern).test(r.text);
+      const retryDelayMs = opts.postRetryDelayMs ?? 2000;
+      let r = { ok: false, text: "" };
+      let matched = false;
+      for (let attempt = 0; attempt <= POST_CONDITION_RETRIES; attempt++) {
+        if (attempt > 0 && retryDelayMs > 0) await new Promise((res) => setTimeout(res, retryDelayMs));
+        r = await execute(post.tool, postArgs, `${skill.name} postCondition`);
+        matched = r.ok && new RegExp(pattern).test(r.text);
+        if (matched) break;
+      }
       opts.logger.log({ type: "verification", tool: post.tool, args: postArgs, expectPattern: pattern, matched, isError: !r.ok, resultText: r.text.slice(0, 2000), skill: skill.name });
       if (!matched) {
         outcome.status = "failure";

@@ -153,9 +153,22 @@ describe("replaySkill happy path", () => {
     const { mcp, policy, logger } = makeMocks((tool) =>
       tool === "browser__eval" ? okResult('"WRONG"') : okResult("Filled"),
     );
-    const r = await replaySkill("set_value", { value: "abc" }, { store, mcp, policy, logger });
+    const r = await replaySkill("set_value", { value: "abc" }, { store, mcp, policy, logger, postRetryDelayMs: 0 });
     expect(r.status).toBe("failure");
     expect(r.summary).toContain("post-condition");
+  });
+
+  it("retries a post-condition read that races a slow render", async () => {
+    const store = makeStore([editSkill]);
+    let reads = 0;
+    const { mcp, policy, logger, calls } = makeMocks((tool) => {
+      if (tool !== "browser__eval") return okResult("Filled");
+      reads++;
+      return reads === 1 ? okResult("Loading...") : okResult('"abc"');
+    });
+    const r = await replaySkill("set_value", { value: "abc" }, { store, mcp, policy, logger, postRetryDelayMs: 0 });
+    expect(r.status).toBe("success");
+    expect(calls.filter((c) => c.tool === "browser__eval").length).toBe(2);
   });
 
   it("returns blocked when policy denies a step", async () => {
