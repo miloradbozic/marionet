@@ -9,8 +9,11 @@ npm run marionet -- run "<task>"                 # run the agent (default profil
 npm run marionet -- run --client opari "<task>"  # client run: their playbooks injected, env filtered to their vars
 npm run marionet -- transcript     # render latest run to markdown (useful if run was killed)
 npm run marionet -- transcript <run-id>
-npm run marionet -- compile [run-id]             # compile a successful+verified run into a reusable skill
-npm run marionet -- compile [run-id] --heuristic # ...skip the LLM naming call (offline positional names)
+npm run marionet -- compile [run-id]             # compile a successful+verified run into reusable skills
+npm run marionet -- compile [run-id] --heuristic # ...skip the LLM segmentation call (offline, monolithic)
+npm run marionet -- replay --client opari set_ean_for_product --param sku=2002 --param ean=999   # zero-LLM replay
+npm run marionet -- replay --client opari set_ean_for_product --csv rows.csv   # bulk: one replay per CSV row
+npm run marionet -- skills --client opari        # list the client's compiled skill library
 
 npm run typecheck                  # type-check orchestrator + both MCP workspaces
 npm test                           # vitest unit tests (orchestrator only; no browser/shell)
@@ -80,7 +83,19 @@ Pipeline (`compileRun` in `compile.ts`):
 
 Segment post-conditions: every segment except the last needs a synthesized structural check (e.g. "the attribute search box exists"); the last segment inherits the run's verified post-condition. `emit.ts` writes the skill files and appends deduped playbook notes to `clients/<client>/playbooks/learned.md`.
 
-Skills live under the client (gitignored, like other client data); the committed proof is `test/compiler.test.ts` running against the real `test/fixtures/akeneo-set-ean.events.jsonl`. Phase 5 (`feat/replay`) executes these steps directly with zero LLM calls on the happy path.
+Skills live under the client (gitignored, like other client data); the committed proof is `test/compiler.test.ts` running against the real `test/fixtures/akeneo-set-ean.events.jsonl`.
+
+### Replay engine (`src/replay/`)
+
+Executes a compiled skill deterministically — **zero LLM calls on the happy path** (Phase 5). `marionet replay [--client x] <skill> --param k=v` resolves the skill (flows expand into primitives with scoped params, cycle-guarded), substitutes params fail-closed (an unresolved `{{placeholder}}` aborts; values substituted into `expectPattern` are regex-escaped), and runs each step through the same `PolicyEngine` gate and `RunLogger` as exploration — a replayed action is no less real than a model-proposed one.
+
+- **Semantic-first targeting**: steps with a `locator` try `browser__click`/`browser__fill` with `role`+`name` first; the recorded CSS selector is the second chance, not the primary anchor.
+- **Post-conditions**: each primitive ends with its read-back check; a mismatch fails the replay (never healed — the engine can't know which earlier step lied).
+- **Self-heal** (`heal.ts`): when a step fails both attempts, one LLM call gets the parameterized step template + error + fresh snapshot and returns a patched step (validated by `validatePatch`, policy-gated at execution). A successful patch is persisted to the skill file, so one heal fixes every flow composing the skill. Budget: 3 heals/replay; `--no-heal` disables; `models.heal` in run.config overrides the heal model.
+- **Bulk**: `--csv rows.csv` (header = param names) replays once per row, continues on failure, summarizes.
+- **run_skill**: when the client's skill library is non-empty, the exploration agent gets a `run_skill` tool that executes skills through this engine — known-good flows in one call instead of step-by-step rediscovery.
+
+The **golden loop test** (`test/golden-loop.test.ts`, needs installed Chrome; ~35s) proves the whole thesis hermetically against `test-site/app.html`: explore → compile → replay (0 LLM calls) → mutate the site (`app.v2.html`) → self-heal → replay clean again.
 
 ### Logging (`runs/<run-id>/`)
 

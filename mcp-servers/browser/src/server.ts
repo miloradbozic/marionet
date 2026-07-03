@@ -306,12 +306,21 @@ server.registerTool(
     try {
       const p = await getPage();
       const fmt = format ?? "text";
+      // Same fail-fast rule as click/fill: a selector that hasn't matched
+      // within the action timeout is almost always the WRONG selector -- do
+      // not burn Playwright's default 30s (seen live: a finish verification
+      // extracting "h1" on a page with no h1 stalled the run for 30s per try).
       if (fmt === "screenshot") {
-        const buffer = selector ? await p.locator(selector).screenshot() : await p.screenshot();
+        const buffer = selector
+          ? await p.locator(selector).screenshot({ timeout: ACTION_TIMEOUT_MS })
+          : await p.screenshot();
         return { content: [{ type: "image" as const, data: buffer.toString("base64"), mimeType: "image/png" }] };
       }
       const locator = selector ? p.locator(selector) : p.locator("body");
-      const text = fmt === "html" ? await locator.innerHTML() : await locator.innerText();
+      const text =
+        fmt === "html"
+          ? await locator.innerHTML({ timeout: ACTION_TIMEOUT_MS })
+          : await locator.innerText({ timeout: ACTION_TIMEOUT_MS });
       return { content: [{ type: "text" as const, text }] };
     } catch (err) {
       return errorResult(err);

@@ -67,6 +67,10 @@ function resultTextOf(e: RunEvent): string {
  *
  * - Steps are tool calls whose tool_result was not an error (finish_task and
  *   denied/errored calls are excluded).
+ * - Perception-only tools (snapshot, extract, cache reads) are dropped: they
+ *   exist for the model's eyes during exploration, and replay has no eyes --
+ *   the post-condition does the verifying. They'd only slow every replay and
+ *   confuse segmentation boundaries.
  * - Each step carries its recorded result text; a semantic-locator suffix in
  *   it becomes the step's `locator`.
  * - The post-condition is the matched `verification` event.
@@ -74,6 +78,14 @@ function resultTextOf(e: RunEvent): string {
  *   same value right before finishing), it's dropped so the skill doesn't do
  *   redundant work.
  */
+const PERCEPTION_TOOLS = new Set([
+  "browser__snapshot",
+  "browser__extract",
+  "browser__cache_read",
+  "browser__cache_write",
+  "fs__list",
+]);
+
 export function extractTrajectory(events: RunEvent[]): ExtractedTrajectory {
   const inputById = new Map<string, { name: string; input: Record<string, unknown> }>();
   for (const e of events) {
@@ -91,7 +103,7 @@ export function extractTrajectory(events: RunEvent[]): ExtractedTrajectory {
     const id = e.toolUseId as string | undefined;
     const call = id ? inputById.get(id) : undefined;
     const name = (call?.name ?? (e.tool as string | undefined)) ?? undefined;
-    if (!name || name === "finish_task") continue;
+    if (!name || name === "finish_task" || PERCEPTION_TOOLS.has(name)) continue;
     const resultText = resultTextOf(e);
     const locator = parseTargetSuffix(resultText);
     steps.push({ tool: name, args: call?.input ?? {}, ...(locator ? { locator } : {}), resultText });

@@ -74,7 +74,7 @@ small-core, audit-first model stays.
 
 ## Roadmap
 
-### Phase 1 — Trust the numbers (`feat/verification`)
+### Phase 1 — Trust the numbers (`feat/verification`) — ✅ merged
 
 Success must be independently verified, and the loop must survive infrastructure flakiness.
 
@@ -95,7 +95,7 @@ Success must be independently verified, and the loop must survive infrastructure
 Acceptance: unit tests for verified-finish (pass, fail-then-recover) and retry; a task that claims success with a
 failing verification does not end the run; `npm run typecheck` and `npm test` green.
 
-### Phase 2 — Accessibility-tree snapshots (`feat/a11y-snapshots`)
+### Phase 2 — Accessibility-tree snapshots (`feat/a11y-snapshots`) — ✅ merged
 
 - New browser tools: `browser__snapshot` (filtered accessibility tree: interactive + labeled elements only, depth
   and size caps, ref per element) and ref-based `browser__click_ref` / `browser__fill_ref`.
@@ -106,7 +106,7 @@ failing verification does not end the run; `npm run typecheck` and `npm test` gr
 Acceptance: on a local test site (see Testing), the model completes a form task without ever passing a CSS
 selector; snapshot output for a large SPA page stays under a fixed token budget.
 
-### Phase 3 — Client profiles + merged Markdown memory (`feat/client-profiles`)
+### Phase 3 — Client profiles + merged Markdown memory (`feat/client-profiles`) — ✅ merged
 
 - `clients/<name>/` layout: `playbooks/*.md` (agent-written), `skills/*.json` (Phase 4), `profile.json`
   (env-var prefix, kubeconfig context, policy overrides).
@@ -118,7 +118,12 @@ selector; snapshot output for a large SPA page stays under a fixed token budget.
 Acceptance: two dummy client profiles cannot read each other's env vars or playbooks; a run without `--client`
 still works (default profile).
 
-### Phase 4 — Trajectory compiler (`feat/compiler`)
+### Phase 4 — Trajectory compiler (`feat/compiler`, completed by `feat/compiler-v2`) — ✅ merged
+
+Status notes (Jul 2026): the first `feat/compiler` merge was monolithic (one run → one skill, raw selectors);
+`feat/compiler-v2` completed the contract — LLM segmentation into primitives + a composed flow skill (validated
+code-side, monolith fallback), semantic locators lifted from the browser tools' new `[target: role "name"]` result
+suffixes, per-segment synthesized post-conditions, and the client-playbook update (`playbooks/learned.md`).
 
 - Post-run pass (one LLM call over `events.jsonl` of a successful, verified run): segments the trajectory into
   skills, extracts parameters by matching task literals against action args, converts acted-on elements to semantic
@@ -131,7 +136,11 @@ still works (default profile).
 Acceptance: compiler unit tests run against real v1 `runs/*/events.jsonl` fixtures; compiling the Jun 30 Akeneo
 run yields an `open_product_by_sku` skill with `sku` parameterized.
 
-### Phase 5 — Replay engine + self-heal (`feat/replay`)
+### Phase 5 — Replay engine + self-heal (`feat/replay`) — ✅ merged
+
+Status notes (Jul 2026): shipped with semantic-first targeting (role+name before the recorded selector),
+fail-closed param substitution (regex-escaped into expectPattern), policy-gated + logged replay steps, heal
+write-back with a 3-heal budget, `--csv` bulk mode, and the `run_skill` loop tool. The golden loop test passes.
 
 - `marionet replay --client opari <skill> --param sku=3332` (and: the agent loop can call a `run_skill` tool).
 - Steps execute directly against Playwright; post-condition checked at the end; zero LLM calls on the happy path.
@@ -142,7 +151,7 @@ run yields an `open_product_by_sku` skill with `sku` parameterized.
 
 Acceptance: the golden loop test (see Testing) passes; a replay run makes zero LLM calls when nothing is broken.
 
-### Phase 6 — Docker-sandboxed shell + effect-based policy (`feat/sandbox`)
+### Phase 6 — Docker-sandboxed shell + effect-based policy (`feat/sandbox`) — not started
 
 - `shell__exec` runs in a per-client container: client repo mounted, kubeconfig for that client's context only,
   egress allowlist. Bare-metal shell becomes an explicit `ask`-gated escape hatch.

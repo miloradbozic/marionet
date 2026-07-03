@@ -57,6 +57,28 @@ describe("trajectory extraction", () => {
     expect(parseTargetSuffix('Filled x [target: textbox ""]')).toBeUndefined();
   });
 
+  it("drops perception-only steps (snapshot/extract/cache) -- replay has no eyes", () => {
+    const events = [
+      {
+        type: "model_response",
+        toolUses: [
+          { id: "t0", name: "browser__cache_read", input: { site: "x", flow: "y" } },
+          { id: "t1", name: "browser__snapshot", input: {} },
+          { id: "t2", name: "browser__fill", input: { selector: "#a", value: "1" } },
+          { id: "t3", name: "browser__extract", input: { selector: "#a" } },
+        ],
+      },
+      { type: "tool_result", toolUseId: "t0", tool: "browser__cache_read", isError: false, content: [] },
+      { type: "tool_result", toolUseId: "t1", tool: "browser__snapshot", isError: false, content: [] },
+      { type: "tool_result", toolUseId: "t2", tool: "browser__fill", isError: false, content: [] },
+      { type: "tool_result", toolUseId: "t3", tool: "browser__extract", isError: false, content: [] },
+      { type: "verification", tool: "browser__eval", args: { expression: "1" }, expectPattern: "1", matched: true },
+      { type: "finish_task", status: "success" },
+    ];
+    const { steps } = extractTrajectory(events);
+    expect(steps.map((s) => s.tool)).toEqual(["browser__fill"]);
+  });
+
   it("lifts locator suffixes in tool results into step.locator", () => {
     const events = [
       {
