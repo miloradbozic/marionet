@@ -68,7 +68,7 @@ export function llmHealer(client: OpenAI, model: string): Healer {
         ],
       }),
     );
-    const text = res.choices[0]?.message?.content ?? "";
+    const text = res.choices?.[0]?.message?.content ?? "";
     const match = text.match(/\{[\s\S]*\}/);
     const parsed = JSON.parse(match ? match[0] : text) as Partial<SkillStep>;
     return validatePatch(parsed, input.availableTools);

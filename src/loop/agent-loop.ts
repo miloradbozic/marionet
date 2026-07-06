@@ -318,12 +318,18 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           const result = await opts.skillRunner.run(skillName, skillParams);
           isError = result.status !== "success";
           content = `run_skill ${skillName}: ${result.status} -- ${result.summary}`;
-          if (result.finalVerification) {
-            lastSkillVerification = result.finalVerification;
+          // Establish the reuse invariant unconditionally: after any run_skill,
+          // the reusable verification is exactly THIS call's, or none. A later
+          // run_skill that fails, or succeeds without a read, must NOT leave an
+          // earlier call's check in place -- otherwise finish_task could certify
+          // success with a stale, unrelated verification.
+          lastSkillVerification = result.status === "success" ? result.finalVerification : undefined;
+          if (lastSkillVerification) {
             content += ` -- this already includes an independently-executed read-only check; if you finish now, call finish_task with reuseLastRunSkillVerification: true instead of writing your own verification.`;
           }
         } catch (err) {
           isError = true;
+          lastSkillVerification = undefined;
           content = `run_skill ${skillName} failed: ${err instanceof Error ? err.message : String(err)}`;
         }
         opts.logger.log({

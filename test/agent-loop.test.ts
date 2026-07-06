@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type OpenAI from "openai";
 import { runAgentLoop, type LlmMessagesClient } from "../src/loop/agent-loop.js";
+import type { SkillRunner } from "../src/loop/run-skill-tool.js";
 import type { McpClientManager, McpToolResult } from "../src/mcp/mcp-client-manager.js";
 import type { PolicyEngine } from "../src/policy/policy-engine.js";
 import type { RunLogger } from "../src/logging/run-logger.js";
@@ -64,6 +65,27 @@ function fakePolicy(action: PolicyDecision["action"] = "allow"): PolicyEngine {
 function fakeMcpManager(callTool: (name: string, args: Record<string, unknown>) => Promise<McpToolResult>): McpClientManager {
   return { tools: [], callTool } as unknown as McpClientManager;
 }
+
+type SkillRunResult = Awaited<ReturnType<SkillRunner["run"]>>;
+
+/** SkillRunner that returns queued results in order (one per run_skill call). */
+function fakeSkillRunner(results: SkillRunResult[]): SkillRunner {
+  const queue = [...results];
+  return {
+    available: () => [{ name: "read_attribute", description: "read an attribute", params: [] }],
+    run: vi.fn(async () => queue.shift() ?? { status: "failure", summary: "no more queued results" }),
+  };
+}
+
+function runSkillCompletion(id: string, skill: string, params: Record<string, string> = {}): OpenAI.ChatCompletion {
+  return makeCompletion(null, [toolCall(id, "run_skill", { skill, params })]);
+}
+
+function finishReuseCompletion(status: "success" | "failure" | "blocked", summary: string): OpenAI.ChatCompletion {
+  return makeCompletion(null, [toolCall("tc_finish", "finish_task", { status, summary, reuseLastRunSkillVerification: true })]);
+}
+
+const SKILL_VERIFICATION = { tool: "browser__eval", args: { expression: "readEan" }, expectPattern: "\\d{6,}" };
 
 function baseOptions(overrides: Partial<Parameters<typeof runAgentLoop>[0]> = {}) {
   return {
@@ -301,5 +323,59 @@ describe("runAgentLoop", () => {
     const secondCallArgs = create.mock.calls[1]![0] as OpenAI.ChatCompletionCreateParamsNonStreaming;
     const nudgeMessage = secondCallArgs.messages[3]!;
     expect(String(nudgeMessage.content)).toMatch(/Continue the task, or call finish_task/);
+  });
+
+  it("finishes via reuseLastRunSkillVerification, re-executing the skill's own post-condition check", async () => {
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(runSkillCompletion("tc_read", "read_attribute", { sku: "1", attribute_code: "ean" }))
+      .mockResolvedValueOnce(finishReuseCompletion("success", "Read the EAN."));
+    const skillRunner = fakeSkillRunner([{ status: "success", summary: "read ok", finalVerification: SKILL_VERIFICATION }]);
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "5706631267335" }] });
+
+    const result = await runAgentLoop(
+      baseOptions({
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
+        mcpClientManager: fakeMcpManager(callTool),
+        skillRunner,
+      }),
+    );
+
+    expect(result.status).toBe("success");
+    // The reused verification is the skill's own recorded check, executed by the loop.
+    expect(callTool).toHaveBeenCalledWith("browser__eval", { expression: "readEan" });
+  });
+
+  it("does not let a stale skill verification certify success after a later run_skill fails", async () => {
+    // read succeeds (stores a verification), a second run_skill fails, then the
+    // model tries to finish success reusing the (now stale) read verification.
+    const create = vi
+      .fn()
+      .mockResolvedValueOnce(runSkillCompletion("tc_read", "read_attribute", { sku: "1", attribute_code: "ean" }))
+      .mockResolvedValueOnce(runSkillCompletion("tc_write", "write_attribute", { sku: "1", attribute_code: "ean", value: "9" }))
+      .mockResolvedValueOnce(finishReuseCompletion("success", "Wrote the EAN."))
+      .mockResolvedValueOnce(finishTaskCompletion("failure", "Write actually failed."));
+    const skillRunner = fakeSkillRunner([
+      { status: "success", summary: "read ok", finalVerification: SKILL_VERIFICATION },
+      { status: "failure", summary: "write failed mid-flow" },
+    ]);
+    // If the stale read-check were reused it WOULD pass (the EAN is still there),
+    // falsely certifying the failed write -- so the reused call must never fire.
+    const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "5706631267335" }] });
+
+    const result = await runAgentLoop(
+      baseOptions({
+        llmClient: { chat: { completions: { create } } } as unknown as LlmMessagesClient,
+        mcpClientManager: fakeMcpManager(callTool),
+        skillRunner,
+      }),
+    );
+
+    expect(result.status).toBe("failure");
+    expect(callTool).not.toHaveBeenCalled();
+    // The reuse-success finish was rejected for lack of a valid reusable check.
+    // (messages is passed by reference, so scan the final array for the rejection.)
+    const finalMessages = (create.mock.calls.at(-1)![0] as OpenAI.ChatCompletionCreateParamsNonStreaming).messages;
+    expect(finalMessages.some((m) => /no run_skill call has succeeded with a post-condition read/.test(String(m.content)))).toBe(true);
   });
 });

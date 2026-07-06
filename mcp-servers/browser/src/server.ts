@@ -368,7 +368,12 @@ server.registerTool(
       const p = await getPage();
       if (selector) {
         const identity = await describeBySelector(p, selector);
-        await p.fill(selector, value, { timeout: ACTION_TIMEOUT_MS });
+        // .first(): a selector legitimately matching >1 element (e.g. an
+        // Akeneo measurement attribute's value + unit inputs both under the
+        // same row selector) should fill the first rather than hard-error --
+        // the read side (document.querySelector) already takes the first
+        // match, so this keeps fill/read semantics consistent.
+        await p.locator(selector).first().fill(value, { timeout: ACTION_TIMEOUT_MS });
         await settle(p);
         return { content: [{ type: "text" as const, text: `Filled ${selector} with "${value}"${targetSuffix(identity)}` }] };
       }
@@ -491,6 +496,104 @@ server.registerTool(
       }
       await p.waitForTimeout(ms ?? 2000);
       return { content: [{ type: "text" as const, text: `Waited ${ms ?? 2000}ms` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__scroll_until_visible",
+  {
+    description:
+      "Repeatedly scrolls the window until a CSS selector matches an element, or gives up after maxAttempts. Use this instead of guessing how many pixels to scroll (or chaining several browser__scroll calls) when content is virtualized/lazy-mounted and you know the target's selector but not where it sits on the page -- e.g. an Akeneo attribute row identified by its data-attribute code, regardless of which attribute group it happens to be under. One call replaces a blind, page-specific scroll sequence with a general, reusable search that works for any target selector.",
+    inputSchema: {
+      selector: z.string().describe("CSS selector to find, e.g. \"tr[data-attribute='ean']\""),
+      amount: z.number().optional().describe("Pixels to scroll per attempt (default 800)"),
+      maxAttempts: z.number().int().positive().max(50).optional().describe("Max scroll attempts before giving up (default 15)"),
+    },
+  },
+  async ({ selector, amount, maxAttempts }) => {
+    try {
+      const p = await getPage();
+      const px = amount ?? 800;
+      const attempts = maxAttempts ?? 15;
+      for (let i = 0; i <= attempts; i++) {
+        if ((await p.locator(selector).count()) > 0) {
+          const identity = await describeBySelector(p, selector);
+          // .first(): a selector legitimately matching >1 element (e.g. a
+          // measurement attribute's value + unit inputs under one row) must
+          // scroll the first, not strict-mode-error -- same rule as
+          // browser__reveal / browser__fill.
+          await p.locator(selector).first().scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+          await settle(p);
+          return { content: [{ type: "text" as const, text: `Found ${selector} after ${i} scroll(s)${targetSuffix(identity)}` }] };
+        }
+        if (i === attempts) break;
+        await p.mouse.wheel(0, px);
+        await settle(p);
+      }
+      return {
+        content: [{ type: "text" as const, text: `Error: "${selector}" not found after ${attempts} scroll attempts (${attempts * px}px total). It may not exist on this page, or need a larger amount/maxAttempts.` }],
+        isError: true,
+      };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__reveal",
+  {
+    description:
+      "Finds a target that's hidden inside a collapsed/accordion section (not just below the fold): tries each element matching sectionSelector in turn -- clicking it to expand/toggle, then scrolling -- until targetSelector matches or every section has been tried. Use this instead of browser__scroll_until_visible when content lives inside a collapsible section whose header must be clicked open first (e.g. Akeneo's product attribute groups, each a `tr.attribute_group_row`) -- plain scrolling alone never reveals it because the collapsed section has no height to scroll to. Works for any attribute/field by target selector alone; the caller never needs to know which section holds it.",
+    inputSchema: {
+      targetSelector: z.string().describe("CSS selector for what you're trying to reveal, e.g. \"tr[data-attribute='ean'] input\""),
+      sectionSelector: z.string().describe("CSS selector matching every collapsible section header on the page, e.g. \"tr.attribute_group_row\""),
+      scrollAmount: z.number().optional().describe("Pixels to scroll after clicking a section, if the target still isn't visible (default 800)"),
+      maxSections: z.number().int().positive().max(50).optional().describe("Max section headers to try before giving up (default 20)"),
+    },
+  },
+  async ({ targetSelector, sectionSelector, scrollAmount, maxSections }) => {
+    try {
+      const p = await getPage();
+      const px = scrollAmount ?? 800;
+
+      const found = async (): Promise<boolean> => (await p.locator(targetSelector).count()) > 0;
+
+      if (await found()) {
+        await p.locator(targetSelector).first().scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+        await settle(p);
+        return { content: [{ type: "text" as const, text: `Found ${targetSelector} without expanding any section` }] };
+      }
+
+      const sectionCount = await p.locator(sectionSelector).count();
+      if (sectionCount === 0) {
+        return { content: [{ type: "text" as const, text: `Error: no elements matched sectionSelector "${sectionSelector}"` }], isError: true };
+      }
+      const limit = Math.min(sectionCount, maxSections ?? 20);
+
+      for (let i = 0; i < limit; i++) {
+        await p.locator(sectionSelector).nth(i).click({ timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+        await settle(p);
+        if (await found()) {
+          await p.locator(targetSelector).first().scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+          await settle(p);
+          return { content: [{ type: "text" as const, text: `Found ${targetSelector} after expanding section ${i + 1}/${limit}` }] };
+        }
+        await p.mouse.wheel(0, px);
+        await settle(p);
+        if (await found()) {
+          await p.locator(targetSelector).first().scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+          await settle(p);
+          return { content: [{ type: "text" as const, text: `Found ${targetSelector} after expanding section ${i + 1}/${limit} and scrolling` }] };
+        }
+      }
+      return {
+        content: [{ type: "text" as const, text: `Error: "${targetSelector}" not found after trying ${limit} section(s) matching "${sectionSelector}"` }],
+        isError: true,
+      };
     } catch (err) {
       return errorResult(err);
     }

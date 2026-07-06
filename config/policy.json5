@@ -42,6 +42,8 @@
     { match: "browser__cache_write", action: "allow" },
     { match: "browser__select", action: "allow" },
     { match: "browser__scroll", action: "allow" },
+    { match: "browser__scroll_until_visible", action: "allow" },
+    { match: "browser__reveal", action: "allow" },
     { match: "browser__extract", action: "allow" },
     { match: "browser__download", action: "allow" },
     { match: "browser__submit_form", action: "allow" },
