@@ -57,6 +57,14 @@ export interface ReplayOutcome {
    * caller (run_skill / CLI) gets the value instead of just pass/fail.
    */
   finalRead?: string;
+  /**
+   * The exact {tool, args, expectPattern} that produced finalRead, with
+   * params already substituted. This already IS an independently-executed
+   * read-only check -- callers (run_skill) surface it so the model can reuse
+   * it verbatim as finish_task's verification instead of inventing a fresh
+   * (and possibly wrong) one from scratch.
+   */
+  finalVerification?: { tool: string; args: Record<string, unknown>; expectPattern: string };
 }
 
 interface PlanEntry {
@@ -71,6 +79,31 @@ const POST_CONDITION_RETRIES = 3;
 
 /** Tools that accept semantic role+name targeting as an alternative to a CSS selector. */
 const SEMANTIC_TOOLS = new Set(["browser__click", "browser__fill"]);
+
+/**
+ * Semantic-first: anchor on role + accessible name when a locator is present
+ * and the tool supports it; the recorded/patched args are the second chance,
+ * not the primary anchor. Shared by original steps AND healed patches -- a
+ * heal patch's `locator` is not guaranteed to be duplicated into its `args`
+ * (the heal LLM sometimes fills one and not the other), so patches need the
+ * same fallback original steps get, not a single bare attempt.
+ */
+function buildAttempts(
+  tool: string,
+  args: Record<string, unknown>,
+  locator: { role: string; name: string } | undefined,
+  params: Record<string, string>,
+): Array<{ args: Record<string, unknown>; kind: string }> {
+  const attempts: Array<{ args: Record<string, unknown>; kind: string }> = [];
+  if (locator && SEMANTIC_TOOLS.has(tool)) {
+    const locatorName = substituteString(locator.name, params);
+    const semanticArgs: Record<string, unknown> = { role: locator.role, name: locatorName };
+    if (tool === "browser__fill" && typeof args.value === "string") semanticArgs.value = args.value;
+    attempts.push({ args: semanticArgs, kind: "semantic" });
+  }
+  attempts.push({ args, kind: "selector" });
+  return attempts;
+}
 
 class ReplayBlocked extends Error {}
 
@@ -151,14 +184,15 @@ export async function replaySkill(name: string, params: Record<string, string>, 
 
   // Look before you act: a skipIf probe that matches means the world is
   // already in the state that primitive leaves behind. Returns the read text
-  // on match (it doubles as evidence / finalRead), null otherwise.
-  const checkSkipIf = async (entry: PlanEntry): Promise<string | null> => {
+  // and the exact check that produced it (it doubles as evidence / finalRead
+  // and a reusable finalVerification) on match, null otherwise.
+  const checkSkipIf = async (entry: PlanEntry): Promise<{ text: string; args: Record<string, unknown>; pattern: string } | null> => {
     const probe = entry.skill.skipIf;
     if (!probe) return null;
     const args = substituteArgs(probe.args, entry.params);
     const pattern = substitutePattern(probe.expectPattern, entry.params);
     const r = await execute(probe.tool, args, `${entry.skill.name} skipIf`);
-    return r.ok && new RegExp(pattern).test(r.text) ? r.text : null;
+    return r.ok && new RegExp(pattern).test(r.text) ? { text: r.text, args, pattern } : null;
   };
 
   try {
@@ -167,12 +201,13 @@ export async function replaySkill(name: string, params: Record<string, string>, 
     // navigate + search primitives that would re-establish it are moot.
     let startIdx = 0;
     for (let j = plan.length - 1; j >= 0; j--) {
-      const text = await checkSkipIf(plan[j]!);
-      if (text !== null) {
+      const skip = await checkSkipIf(plan[j]!);
+      if (skip !== null) {
         startIdx = j + 1;
         for (let k = 0; k <= j; k++) outcome.primitivesSkipped.push(plan[k]!.skill.name);
-        outcome.finalRead = text;
-        opts.logger.log({ type: "replay_skip", upTo: plan[j]!.skill.name, skipped: outcome.primitivesSkipped, resultText: text.slice(0, 500) });
+        outcome.finalRead = skip.text;
+        outcome.finalVerification = { tool: plan[j]!.skill.skipIf!.tool, args: skip.args, expectPattern: skip.pattern };
+        opts.logger.log({ type: "replay_skip", upTo: plan[j]!.skill.name, skipped: outcome.primitivesSkipped, resultText: skip.text.slice(0, 500) });
         break;
       }
     }
@@ -184,11 +219,12 @@ export async function replaySkill(name: string, params: Record<string, string>, 
       // Same look-before-you-act check mid-flow: an earlier primitive may
       // have already produced this one's goal state.
       if (i > startIdx) {
-        const text = await checkSkipIf(entry);
-        if (text !== null) {
+        const skip = await checkSkipIf(entry);
+        if (skip !== null) {
           outcome.primitivesSkipped.push(skill.name);
-          outcome.finalRead = text;
-          opts.logger.log({ type: "replay_skip", upTo: skill.name, skipped: [skill.name], resultText: text.slice(0, 500) });
+          outcome.finalRead = skip.text;
+          outcome.finalVerification = { tool: skill.skipIf!.tool, args: skip.args, expectPattern: skip.pattern };
+          opts.logger.log({ type: "replay_skip", upTo: skill.name, skipped: [skill.name], resultText: skip.text.slice(0, 500) });
           continue;
         }
       }
@@ -203,18 +239,7 @@ export async function replaySkill(name: string, params: Record<string, string>, 
         }
 
         const args = substituteArgs(step.args, entry.params);
-
-        // Semantic-first: anchor on role + accessible name when the step
-        // carries a locator and the tool supports it; the recorded selector
-        // is the second chance, not the primary anchor.
-        const attempts: Array<{ args: Record<string, unknown>; kind: string }> = [];
-        if (step.locator && SEMANTIC_TOOLS.has(step.tool)) {
-          const locatorName = substituteString(step.locator.name, entry.params);
-          const semanticArgs: Record<string, unknown> = { role: step.locator.role, name: locatorName };
-          if (step.tool === "browser__fill" && typeof args.value === "string") semanticArgs.value = args.value;
-          attempts.push({ args: semanticArgs, kind: "semantic" });
-        }
-        attempts.push({ args, kind: "selector" });
+        const attempts = buildAttempts(step.tool, args, step.locator, entry.params);
 
         let ok = false;
         let lastError = "";
@@ -231,13 +256,20 @@ export async function replaySkill(name: string, params: Record<string, string>, 
           const patched = await heal(skill, i, step, entry.params, lastError, opts, outcome);
           if (patched) {
             const patchArgs = substituteArgs(patched.args, entry.params);
-            const r = await execute(patched.tool, patchArgs, `${ctx} (healed)`);
-            if (r.ok) {
+            const patchAttempts = buildAttempts(patched.tool, patchArgs, patched.locator, entry.params);
+            let healed = false;
+            for (const attempt of patchAttempts) {
+              const r = await execute(patched.tool, attempt.args, `${ctx} (healed:${attempt.kind})`);
+              if (r.ok) {
+                healed = true;
+                break;
+              }
+              lastError = r.text;
+            }
+            if (healed) {
               persistPatch(opts.store, skill.name, i, patched, opts.logger);
               outcome.healsApplied++;
               ok = true;
-            } else {
-              lastError = r.text;
             }
           }
         }
@@ -276,6 +308,7 @@ export async function replaySkill(name: string, params: Record<string, string>, 
         return outcome;
       }
       outcome.finalRead = r.text;
+      outcome.finalVerification = { tool: post.tool, args: postArgs, expectPattern: pattern };
     }
   } catch (err) {
     if (err instanceof ReplayBlocked) {

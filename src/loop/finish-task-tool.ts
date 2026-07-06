@@ -16,6 +16,15 @@ export interface FinishTaskInput {
   summary: string;
   details?: string;
   verification?: FinishVerification;
+  /**
+   * Use the verification from the most recent successful run_skill call
+   * instead of specifying one. That verification is already an
+   * independently-executed read-only check (the skill's own post-condition),
+   * so re-running it is redundant, and hand-transcribing its {tool, args,
+   * expectPattern} into a fresh tool call risks mis-escaping a JS expression
+   * full of nested quotes. This flag sidesteps both.
+   */
+  reuseLastRunSkillVerification?: boolean;
 }
 
 export const FINISH_TASK_TOOL_NAME = "finish_task";
@@ -35,7 +44,7 @@ export const FINISH_TASK_TOOL: OpenAI.ChatCompletionTool = {
         verification: {
           type: "object",
           description:
-            'Required when status is "success". A read-only tool call that proves the outcome, executed by the system after you call finish_task.',
+            'A read-only tool call that proves the outcome, executed by the system after you call finish_task. Required when status is "success", UNLESS reuseLastRunSkillVerification is true.',
           properties: {
             tool: {
               type: "string",
@@ -52,6 +61,11 @@ export const FINISH_TASK_TOOL: OpenAI.ChatCompletionTool = {
             },
           },
           required: ["tool", "args", "expectPattern"],
+        },
+        reuseLastRunSkillVerification: {
+          type: "boolean",
+          description:
+            'Set true instead of providing verification when the most recent run_skill call already succeeded: reuses its own post-condition check rather than you re-specifying (and risking mis-escaping) one.',
         },
       },
       required: ["status", "summary"],

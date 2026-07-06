@@ -4,7 +4,7 @@ import type { McpClientManager } from "../mcp/mcp-client-manager.js";
 import type { PolicyEngine } from "../policy/policy-engine.js";
 import { confirmToolCall } from "../confirm/cli-prompt.js";
 import type { RunLogger } from "../logging/run-logger.js";
-import { FINISH_TASK_TOOL, FINISH_TASK_TOOL_NAME, type FinishTaskInput } from "./finish-task-tool.js";
+import { FINISH_TASK_TOOL, FINISH_TASK_TOOL_NAME, type FinishTaskInput, type FinishVerification } from "./finish-task-tool.js";
 import { buildRunSkillTool, RUN_SKILL_TOOL_NAME, type SkillRunner } from "./run-skill-tool.js";
 import { mcpResultToToolContent } from "./message-mapper.js";
 
@@ -27,6 +27,7 @@ Browser perception — how to find elements:
 
 Efficiency rules — these are hard constraints, not suggestions:
 - Compiled skills OUTRANK playbooks: when a run_skill tool is available and one of its skills covers the task (or a part of it), call run_skill FIRST -- before any navigation, snapshot, or playbook step. Playbook notes describing the same flow are the fallback for when no skill matches or a skill run fails.
+- When a successful run_skill result includes "reuse it verbatim as finish_task's verification: {...}", copy that exact JSON as your finish_task verification. It is already an independently-executed read-only check -- do NOT invent a different selector/expression to "double-check" it; a guessed one is far more likely to be wrong than the one just proven to work.
 - NEVER guess a skill parameter value. If the task derives a value from current site state (e.g. "set X to its current value + 1"), you must READ the current value first -- via a read skill (get_*/read_* in the run_skill catalog, which return the value in their result) if one exists, otherwise by opening the page and reading it -- and only then call the mutating skill with the computed value. A skill call with an invented parameter writes wrong data while reporting success.
 - If playbooks are provided in the client context below (or the task points at one), follow them exactly when they cover a step you are about to take, without any extra inspection or extraction first. Playbooks contain the real site URLs and known-working selectors.
 - ONLY when no compiled skill covers the task: at the start of a browser flow, call browser__cache_read using the ACTUAL site URL from the playbook or task (never a placeholder URL). If a run_skill skill matches, skip cache_read entirely -- the skill already contains the working steps. If cache_read returns cached data, use those selectors IMMEDIATELY and DIRECTLY -- do not call browser__extract or any other tool to "verify" or "explore" first. Skip all discovery entirely. After a flow succeeds, call browser__cache_write with only the keys the next run can use directly (flat object, no prose).
@@ -175,6 +176,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   let iter = 0;
   let nudges = 0;
   const failureCounts = new Map<string, number>();
+  // Set whenever a run_skill call succeeds with a post-condition read, so
+  // finish_task's reuseLastRunSkillVerification can point back at an
+  // already-executed check instead of the model re-transcribing one.
+  let lastSkillVerification: FinishVerification | undefined;
 
   for (;;) {
     iter++;
@@ -270,7 +275,23 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       if (name === FINISH_TASK_TOOL_NAME) {
         const input = args as unknown as FinishTaskInput;
 
+        if (!["success", "failure", "blocked"].includes(input.status)) {
+          const rejection = `finish_task rejected: status must be "success", "failure", or "blocked" (got ${JSON.stringify(input.status)}). Re-send with a valid status.`;
+          opts.logger.log({ type: "finish_rejected", reason: rejection });
+          messages.push({ role: "tool", tool_call_id: tc.id, content: rejection });
+          continue;
+        }
+
         if (input.status === "success") {
+          if (input.reuseLastRunSkillVerification) {
+            if (!lastSkillVerification) {
+              const rejection = "finish_task rejected: reuseLastRunSkillVerification was true, but no run_skill call has succeeded with a post-condition read yet. Provide an explicit verification instead.";
+              opts.logger.log({ type: "finish_rejected", reason: rejection });
+              messages.push({ role: "tool", tool_call_id: tc.id, content: rejection });
+              continue;
+            }
+            input.verification = lastSkillVerification;
+          }
           const rejection = await runFinishVerification(input, opts);
           if (rejection) {
             opts.logger.log({ type: "finish_rejected", reason: rejection });
@@ -297,6 +318,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           const result = await opts.skillRunner.run(skillName, skillParams);
           isError = result.status !== "success";
           content = `run_skill ${skillName}: ${result.status} -- ${result.summary}`;
+          if (result.finalVerification) {
+            lastSkillVerification = result.finalVerification;
+            content += ` -- this already includes an independently-executed read-only check; if you finish now, call finish_task with reuseLastRunSkillVerification: true instead of writing your own verification.`;
+          }
         } catch (err) {
           isError = true;
           content = `run_skill ${skillName} failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -312,6 +337,12 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         messages.push({ role: "tool", tool_call_id: tc.id, content });
         continue;
       }
+
+      // Any other tool call means state may have moved on since the last
+      // run_skill success -- its post-condition check no longer necessarily
+      // proves what a later finish_task claims (e.g. a manual edit+save after
+      // a read-only skill run). Reuse is only valid immediately after.
+      lastSkillVerification = undefined;
 
       const decision = opts.policy.evaluate(name, args);
       opts.logger.log({

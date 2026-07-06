@@ -388,25 +388,30 @@ server.registerTool(
   "browser__press",
   {
     description:
-      "Press a keyboard key, optionally after focusing a field. Use this to submit a search box or form that only reacts to Enter (browser__fill sets a value but sends no keystrokes, so debounced/keyboard-driven searches never fire). Key names follow Playwright: 'Enter', 'Escape', 'Tab', 'ArrowDown', etc. If selector is given the field is focused (clicked) first; otherwise the key goes to the currently focused element.",
+      "Press a keyboard key, optionally after focusing a field. Use this to submit a search box or form that only reacts to Enter (browser__fill sets a value but sends no keystrokes, so debounced/keyboard-driven searches never fire). Key names follow Playwright: 'Enter', 'Escape', 'Tab', 'ArrowDown', etc. To focus a field first, prefer `ref` from browser__snapshot over guessing a CSS `selector`; if neither is given the key goes to the currently focused element.",
     inputSchema: {
       key: z.string().describe("Key to press, e.g. 'Enter'"),
-      selector: z.string().optional().describe("CSS selector to focus before pressing (optional)"),
+      ref: z.string().optional().describe("Snapshot ref from browser__snapshot to focus before pressing (preferred)"),
+      selector: z.string().optional().describe("CSS selector to focus before pressing, if no snapshot ref is available"),
     },
   },
-  async ({ key, selector }) => {
+  async ({ key, ref, selector }) => {
     try {
       const p = await getPage();
+      const target = ref ? refSelector(ref) : selector;
       let identity: ElementIdentity | null = null;
-      if (selector) {
-        identity = await describeBySelector(p, selector);
-        await p.press(selector, key, { timeout: ACTION_TIMEOUT_MS });
+      if (target) {
+        if (ref && (await p.locator(target).count()) === 0) {
+          return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
+        }
+        identity = await describeBySelector(p, target);
+        await p.press(target, key, { timeout: ACTION_TIMEOUT_MS });
       } else {
         await p.keyboard.press(key);
       }
       await settle(p);
       return {
-        content: [{ type: "text" as const, text: `Pressed ${key}${selector ? ` on ${selector}${targetSuffix(identity)}` : ""}` }],
+        content: [{ type: "text" as const, text: `Pressed ${key}${target ? ` on ${ref ?? selector}${targetSuffix(identity)}` : ""}` }],
       };
     } catch (err) {
       return errorResult(err);
@@ -486,6 +491,40 @@ server.registerTool(
       }
       await p.waitForTimeout(ms ?? 2000);
       return { content: [{ type: "text" as const, text: `Waited ${ms ?? 2000}ms` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__scroll",
+  {
+    description:
+      "Scroll the page. Use this before snapshot/extract when content you expect isn't there -- many SPAs (e.g. Akeneo's product attribute groups) virtualize/lazy-mount long lists, so a section's fields don't exist in the DOM at all until scrolled into view, no matter how long you wait_for or how you query snapshot. Prefer `ref`/`selector` to scroll a specific element (e.g. a group header) into view; use `amount` to scroll the whole window by a pixel offset (negative scrolls up) when there's no specific element to target yet.",
+    inputSchema: {
+      ref: z.string().optional().describe("Snapshot ref to scroll into view (preferred)"),
+      selector: z.string().optional().describe("CSS selector to scroll into view, if no snapshot ref is available"),
+      amount: z.number().optional().describe("Pixels to scroll the whole page by (default 800; negative scrolls up); used if neither ref nor selector is given"),
+    },
+  },
+  async ({ ref, selector, amount }) => {
+    try {
+      const p = await getPage();
+      const target = ref ? refSelector(ref) : selector;
+      if (target) {
+        if (ref && (await p.locator(target).count()) === 0) {
+          return { content: [{ type: "text" as const, text: `Error: ${REF_MISS_HINT}` }], isError: true };
+        }
+        const identity = await describeBySelector(p, target);
+        await p.locator(target).scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+        await settle(p);
+        return { content: [{ type: "text" as const, text: `Scrolled ${ref ?? selector} into view${targetSuffix(identity)}` }] };
+      }
+      const px = amount ?? 800;
+      await p.mouse.wheel(0, px);
+      await settle(p);
+      return { content: [{ type: "text" as const, text: `Scrolled window by ${px}px` }] };
     } catch (err) {
       return errorResult(err);
     }

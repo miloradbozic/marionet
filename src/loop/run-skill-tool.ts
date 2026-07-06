@@ -18,7 +18,14 @@ export interface SkillSummary {
 
 export interface SkillRunner {
   available(): SkillSummary[];
-  run(name: string, params: Record<string, string>): Promise<{ status: string; summary: string }>;
+  run(
+    name: string,
+    params: Record<string, string>,
+  ): Promise<{
+    status: string;
+    summary: string;
+    finalVerification?: { tool: string; args: Record<string, unknown>; expectPattern: string };
+  }>;
 }
 
 export function buildRunSkillTool(skills: SkillSummary[]): OpenAI.ChatCompletionTool {

@@ -27,7 +27,7 @@ google-chrome --remote-debugging-port=9222 --user-data-dir=/tmp/marionet-chrome
 
 ## Architecture
 
-Marionet is a thin agentic loop around the Anthropic API. It gives the model shell, filesystem, and browser access via MCP servers, then controls what it's allowed to do through a policy engine.
+Marionet is a thin agentic loop around an OpenAI-compatible LLM API (`src/llm-client.ts` routes by model prefix to OpenRouter, DeepSeek, or Anthropic direct; currently configured in `config/run.config.json` for Qwen3-VL-235B-A22B via OpenRouter). It gives the model shell, filesystem, and browser access via MCP servers, then controls what it's allowed to do through a policy engine.
 
 ```
 cli.ts
@@ -39,7 +39,7 @@ cli.ts
 
 ### Agent loop (`src/loop/agent-loop.ts`)
 
-One iteration = one Anthropic API call. The loop handles three cases per response:
+One iteration = one LLM API call. The loop handles three cases per response:
 - **Tool calls** → evaluate each against policy, execute via MCP, feed results back
 - **No tool calls** → inject a nudge message and continue (up to `maxTurns + nudges` total)
 - **`finish_task` call** → return immediately with status/summary
@@ -68,8 +68,9 @@ Both servers are in `mcp-servers/` and are separate npm workspaces (`mcp-servers
 - `browser__press` — presses a keyboard key (e.g. `Enter`), optionally after focusing a selector. Needed because `browser__fill` sets a value and fires only an `input` event — it sends no keystrokes, so debounced or Enter-to-submit search boxes (e.g. the Akeneo product grid) never fire on fill alone.
 
 - `browser__click_text` — clicks the element whose visible text matches a string (substring or exact). If the match is inside a `<tr>` it clicks the whole row (data grids open on row click); else the nearest `<a>`/`<button>`; else the element. Reports whether the page navigated. Exists so the model stops hand-writing fragile `browser__eval` row-clicks (which repeatedly paraphrased into broken variants that no-oped and falsely reported success). Raw-string `page.evaluate` to dodge the esbuild `__name` hazard.
+- `browser__scroll` — scrolls a ref/selector into view, or the whole window by a pixel offset. Exists because some SPAs virtualize/lazy-mount long lists (e.g. Akeneo's product attribute groups): a section's fields are absent from the DOM entirely — not just visually hidden — until scrolled into view, so no amount of `wait_for` or `snapshot` querying finds them first.
 
-**Auto-settle.** Every mutating browser tool (`navigate`, `click`, `click_ref`, `fill`, `fill_ref`, `fill_from_env`, `press`, `select`, `submit_form`, `eval`) calls `settle(page)` before returning: it resolves once the DOM has been quiet for ~500ms (or after a 4s cap). This bakes a human-like "wait for the page to stop changing, then look" beat into every action, so the model can't act on or perceive a half-rendered SPA (the root cause of stale-row / "0 results" misreads on Akeneo). It's adaptive — near-instant on a static page, longer only while the page is actually re-rendering. Implemented as a raw-string `page.evaluate` to dodge the same esbuild `__name` hazard documented in `snapshot.ts`.
+**Auto-settle.** Every mutating browser tool (`navigate`, `click`, `click_ref`, `fill`, `fill_ref`, `fill_from_env`, `press`, `select`, `submit_form`, `eval`, `scroll`) calls `settle(page)` before returning: it resolves once the DOM has been quiet for ~500ms (or after a 4s cap). This bakes a human-like "wait for the page to stop changing, then look" beat into every action, so the model can't act on or perceive a half-rendered SPA (the root cause of stale-row / "0 results" misreads on Akeneo). It's adaptive — near-instant on a static page, longer only while the page is actually re-rendering. Implemented as a raw-string `page.evaluate` to dodge the same esbuild `__name` hazard documented in `snapshot.ts`.
 
 ### Trajectory compiler (`src/compiler/`)
 
@@ -118,7 +119,7 @@ Secrets go in `.env` (gitignored). `tsx --env-file=.env` loads them into the Nod
 
 **Add a new MCP server**: add it to `config/run.config.json` under `mcpServers`. It will be spawned as a stdio subprocess and its tools auto-registered.
 
-**Change the model or ceilings**: edit `config/run.config.json` (`model`, `maxTurns`, `maxCostUsd`, `maxTokens`). Pricing constants for cost estimation live in `src/anthropic-client.ts` and need manual updates if the model changes.
+**Change the model or ceilings**: edit `config/run.config.json` (`model`, `maxTurns`, `maxCostUsd`, `maxTokens`). Cost estimation reads the `pricing` field from that same config (via `estimateCostUsd` in `src/llm-client.ts`) and needs manual updates if the model changes.
 
 ## Future directions
 

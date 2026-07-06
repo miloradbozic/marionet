@@ -107,7 +107,7 @@ async function runCommand(repoRoot: string, task: string, clientName: string | u
         available: () => store.list().map((s) => ({ name: s.name, description: s.description, params: s.params })),
         run: async (name, params) => {
           const r = await replaySkill(name, params, { store, mcp: mcpClientManager, policy, logger });
-          return { status: r.status, summary: r.summary };
+          return { status: r.status, summary: r.summary, finalVerification: r.finalVerification };
         },
       }
     : undefined;
