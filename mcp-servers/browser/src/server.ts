@@ -679,6 +679,38 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "browser__select_record",
+  {
+    description:
+      "Set a type-ahead / autocomplete select widget -- the kind that is NOT a native <select> (so browser__select can't touch it): a search input that filters a dropdown of records you then click. Akeneo simple-select and reference-entity attributes are exactly this (input placeholder \"Click here to select a record\"). Does the whole interaction atomically -- close any stray dropdown, focus + clear the input, type searchText, wait for the option to appear, click it -- because doing it as separate click/fill/click steps is flaky (the dropdown's open/close and search-debounce state leaks between calls). optionSelector targets the filtered option (on Akeneo, `[data-testid=\"<option_code>\"]`).",
+    inputSchema: {
+      inputSelector: z.string().describe("CSS selector for the widget's search input, e.g. \"tr[data-attribute='color'] input\""),
+      optionSelector: z.string().describe("CSS selector for the option to click once filtered, e.g. \"[data-testid='color_gold']\""),
+      searchText: z.string().describe("Text to type to filter the list to the wanted option, e.g. \"gold\""),
+    },
+  },
+  async ({ inputSelector, optionSelector, searchText }) => {
+    try {
+      const p = await getPage();
+      const input = p.locator(inputSelector).first();
+      await p.keyboard.press("Escape").catch(() => {}); // dismiss any open dropdown from a prior action
+      await input.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+      await input.click({ timeout: ACTION_TIMEOUT_MS });
+      await input.fill(""); // clear any residual search text
+      await input.type(searchText, { delay: 30 });
+      const option = p.locator(optionSelector).first();
+      await option.waitFor({ state: "visible", timeout: ACTION_TIMEOUT_MS });
+      await option.click({ timeout: ACTION_TIMEOUT_MS });
+      await p.keyboard.press("Escape").catch(() => {}); // close the dropdown so it can't overlay the next action
+      await settle(p);
+      return { content: [{ type: "text" as const, text: `Selected option ${optionSelector} in ${inputSelector} (searched "${searchText}")` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
 // Works for: standard HTML forms where a [type=submit] button/input is a
 // descendant of `selector`. Clicking p.click(selector) on a <form> element
 // itself does nothing in Playwright -- you must click the submit control.
