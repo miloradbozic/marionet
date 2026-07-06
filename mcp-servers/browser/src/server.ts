@@ -5,6 +5,7 @@ import { chromium, type Browser, type Page } from "playwright";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { buildSnapshot, renderSnapshot, refSelector, REF_MISS_HINT } from "./snapshot.js";
+import { buildEnumerateExpr, renderEnumerate, type EnumerateResult } from "./enumerate.js";
 import { DESCRIBE_ELEMENT_SRC, describeBySelector, targetSuffix, type ElementIdentity } from "./identity.js";
 
 // Never launches its own browser -- always attaches over CDP to a browser the
@@ -322,6 +323,29 @@ server.registerTool(
           ? await locator.innerHTML({ timeout: ACTION_TIMEOUT_MS })
           : await locator.innerText({ timeout: ACTION_TIMEOUT_MS });
       return { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
+  "browser__enumerate",
+  {
+    description:
+      "List every element matching a CSS selector, in document order, returning chosen data per element as a JSON array. Use this to read the STRUCTURE of a repeated region in one call -- e.g. every row of a data grid, every card in a list, or (on an Akeneo product page) every attribute row (`tr[data-attribute]`) to learn the full set of attribute codes without clicking through them. Far cheaper and more reliable than a full browser__extract + parsing prose, and unlike browser__snapshot it can read arbitrary DOM attributes (data-*, class) you name, not just interactive elements. Returns [] if nothing matches (an empty region, not an error).",
+    inputSchema: {
+      selector: z.string().describe("CSS selector for the repeated element, e.g. \"tr[data-attribute]\" or \"li.result\""),
+      attributes: z.array(z.string()).optional().describe("DOM attribute names to read per element, e.g. [\"data-attribute\", \"class\"]"),
+      text: z.boolean().optional().describe("Include each element's trimmed visible text (capped at 200 chars) as a `text` field"),
+      limit: z.number().int().positive().max(2000).optional().describe("Max elements to return (default 1000)"),
+    },
+  },
+  async ({ selector, attributes, text, limit }) => {
+    try {
+      const p = await getPage();
+      const result = (await p.evaluate(buildEnumerateExpr({ selector, attributes, text, limit }))) as EnumerateResult;
+      return { content: [{ type: "text" as const, text: renderEnumerate(result) }] };
     } catch (err) {
       return errorResult(err);
     }
