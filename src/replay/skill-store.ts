@@ -7,9 +7,21 @@ import type { AnySkill } from "../compiler/skill.types.js";
  * or workspace/skills/ for the default profile). Also the write-back target
  * for self-heal: a healed step is persisted so one heal fixes every future
  * replay -- and every flow that composes the healed primitive.
+ *
+ * Tenant isolation: every skill is stamped with the client it was compiled
+ * for (`client?: string`, undefined for the unscoped default profile).
+ * `load()` is the sole read path used by direct replay, flow expansion
+ * (`resolvePlan` recurses through it), `run_skill`, and `marionet skills` --
+ * so checking the stamp there, fail-closed, covers every consumer. This
+ * catches a skill file ending up under the wrong client's directory (manual
+ * copy, restored backup, future non-per-directory storage) even though
+ * directory separation already prevents it in normal operation.
  */
 export class SkillStore {
-  constructor(readonly skillsDir: string) {}
+  constructor(
+    readonly skillsDir: string,
+    readonly expectedClient?: string,
+  ) {}
 
   pathOf(name: string): string {
     if (!/^[a-z][a-z0-9_]*$/.test(name)) throw new Error(`invalid skill name "${name}"`);
@@ -25,7 +37,14 @@ export class SkillStore {
     if (!existsSync(p)) {
       throw new Error(`no skill "${name}" in ${this.skillsDir}${this.listNames().length ? ` (available: ${this.listNames().join(", ")})` : " (library is empty)"}`);
     }
-    return JSON.parse(readFileSync(p, "utf-8")) as AnySkill;
+    const skill = JSON.parse(readFileSync(p, "utf-8")) as AnySkill;
+    if (skill.client !== this.expectedClient) {
+      throw new Error(
+        `tenant isolation: skill "${name}" in ${this.skillsDir} belongs to client ${JSON.stringify(skill.client ?? null)}, ` +
+          `but this store is scoped to ${JSON.stringify(this.expectedClient ?? null)}`,
+      );
+    }
+    return skill;
   }
 
   save(skill: AnySkill): string {

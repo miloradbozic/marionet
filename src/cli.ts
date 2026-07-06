@@ -101,7 +101,7 @@ async function runCommand(repoRoot: string, task: string, clientName: string | u
 
   // Compiled skills become a run_skill tool: the agent can execute a
   // known-good flow in one call instead of rediscovering it step by step.
-  const store = new SkillStore(skillsDirFor(repoRoot, profile?.name));
+  const store = new SkillStore(skillsDirFor(repoRoot, profile?.name), profile?.name);
   const skillRunner: SkillRunner | undefined = store.listNames().length
     ? {
         available: () => store.list().map((s) => ({ name: s.name, description: s.description, params: s.params })),
@@ -313,7 +313,7 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
   const runConfig = loadRunConfig(path.join(repoRoot, "config", "run.config.json"));
   const profile: ClientProfile | undefined = cliArgs.clientName ? loadClientProfile(repoRoot, cliArgs.clientName) : undefined;
   const policy = new PolicyEngine(path.join(repoRoot, "config", "policy.json5"), profile?.policyPath);
-  const store = new SkillStore(skillsDirFor(repoRoot, profile?.name));
+  const store = new SkillStore(skillsDirFor(repoRoot, profile?.name), profile?.name);
 
   await ensureChrome(runConfig.browser.cdpEndpoint);
   mkdirSync(path.join(repoRoot, "runs"), { recursive: true });
@@ -375,7 +375,7 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
 }
 
 function skillsCommand(repoRoot: string, clientName: string | undefined): void {
-  const store = new SkillStore(skillsDirFor(repoRoot, clientName));
+  const store = new SkillStore(skillsDirFor(repoRoot, clientName), clientName);
   const skills = store.list();
   if (!skills.length) {
     console.log(`No skills in ${store.skillsDir}. Compile a successful run first: marionet compile [run-id]`);

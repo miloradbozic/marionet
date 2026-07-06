@@ -13,9 +13,9 @@ import type { RunLogger } from "../src/logging/run-logger.js";
 
 const SOURCE = { runId: "r", task: "t", model: "m", compiledAt: "2026-07-02T00:00:00Z" };
 
-function makeStore(skills: Array<Skill | FlowSkill>): SkillStore {
+function makeStore(skills: Array<Skill | FlowSkill>, expectedClient?: string): SkillStore {
   const dir = mkdtempSync(path.join(os.tmpdir(), "marionet-skills-"));
-  const store = new SkillStore(dir);
+  const store = new SkillStore(dir, expectedClient);
   for (const s of skills) store.save(s);
   return store;
 }
@@ -126,6 +126,45 @@ describe("resolvePlan", () => {
   });
 });
 
+describe("tenant isolation", () => {
+  it("loads a skill whose client stamp matches the store's expected client", () => {
+    const store = makeStore([{ ...openSkill, client: "opari" }], "opari");
+    expect(store.load("open_thing").client).toBe("opari");
+  });
+
+  it("loads an unscoped skill from an unscoped store", () => {
+    const store = makeStore([openSkill], undefined);
+    expect(store.load("open_thing").client).toBeUndefined();
+  });
+
+  it("refuses to load a skill stamped for a different client", () => {
+    const store = makeStore([{ ...openSkill, client: "opari" }], "other-client");
+    expect(() => store.load("open_thing")).toThrow(/tenant isolation/);
+  });
+
+  it("refuses to load a client-owned skill from an unscoped store", () => {
+    const store = makeStore([{ ...openSkill, client: "opari" }], undefined);
+    expect(() => store.load("open_thing")).toThrow(/tenant isolation/);
+  });
+
+  it("refuses to load an unscoped skill from a client-scoped store", () => {
+    const store = makeStore([openSkill], "opari");
+    expect(() => store.load("open_thing")).toThrow(/tenant isolation/);
+  });
+
+  it("blocks a flow from pulling in another client's primitive during resolvePlan", () => {
+    const store = makeStore(
+      [
+        { ...openSkill, client: "opari" },
+        { ...editSkill, client: "other-client" },
+        { ...flow, client: "opari" },
+      ],
+      "opari",
+    );
+    expect(() => resolvePlan(store, "open_and_set", { id: "7", value: "x" })).toThrow(/tenant isolation/);
+  });
+});
+
 describe("replaySkill happy path", () => {
   it("replays a flow with zero LLM calls and checks every post-condition", async () => {
     const store = makeStore([openSkill, editSkill, flow]);
@@ -146,6 +185,9 @@ describe("replaySkill happy path", () => {
     expect(calls[0]).toEqual({ tool: "browser__fill", args: { selector: "#search", value: "777" } });
     // Both post-conditions executed.
     expect(calls.filter((c) => c.tool === "browser__eval").length).toBe(2);
+    // The last post-condition's read is returned -- how read-only skills yield data.
+    expect(r.finalRead).toBe('"abc"');
+    expect(r.summary).toContain('post-condition read: "abc"');
   });
 
   it("fails the replay when a post-condition does not match", async () => {
@@ -156,6 +198,69 @@ describe("replaySkill happy path", () => {
     const r = await replaySkill("set_value", { value: "abc" }, { store, mcp, policy, logger, postRetryDelayMs: 0 });
     expect(r.status).toBe("failure");
     expect(r.summary).toContain("post-condition");
+  });
+
+  it("skips predecessors when a later primitive's skipIf already holds (backward scan)", async () => {
+    const openWithSkipIf: Skill = {
+      ...openSkill,
+      skipIf: { tool: "browser__eval", args: { expression: "probe_open" }, expectPattern: "#/thing/{{id}}" },
+    };
+    const store = makeStore([openWithSkipIf, editSkill, flow]);
+    const { mcp, policy, logger, calls } = makeMocks((tool, args) => {
+      if (tool === "browser__eval" && args.expression === "probe_open") return okResult("#/thing/777");
+      if (tool === "browser__eval") return okResult('"abc"');
+      return okResult("Filled");
+    });
+
+    const r = await replaySkill("open_and_set", { id: "777", value: "abc" }, { store, mcp, policy, logger });
+
+    expect(r.status).toBe("success");
+    expect(r.primitivesSkipped).toEqual(["open_thing"]);
+    expect(r.primitivesRun).toEqual(["set_value"]);
+    expect(r.stepsExecuted).toBe(1);
+    // The thing was never re-opened: no fill of the search box.
+    expect(calls.some((c) => c.tool === "browser__fill" && c.args.selector === "#search")).toBe(false);
+    expect(r.summary).toContain("skipped open_thing");
+  });
+
+  it("runs everything when skipIf does not match", async () => {
+    const openWithSkipIf: Skill = {
+      ...openSkill,
+      skipIf: { tool: "browser__eval", args: { expression: "probe_open" }, expectPattern: "#/thing/{{id}}" },
+    };
+    const store = makeStore([openWithSkipIf, editSkill, flow]);
+    const { mcp, policy, logger } = makeMocks((tool, args) => {
+      if (tool === "browser__eval" && args.expression === "probe_open") return okResult("#/somewhere/else");
+      if (tool === "browser__eval" && String(args.expression).includes("location.hash")) return okResult("#/thing/777");
+      if (tool === "browser__eval") return okResult('"abc"');
+      return okResult("Filled");
+    });
+
+    const r = await replaySkill("open_and_set", { id: "777", value: "abc" }, { store, mcp, policy, logger });
+
+    expect(r.status).toBe("success");
+    expect(r.primitivesSkipped).toEqual([]);
+    expect(r.primitivesRun).toEqual(["open_thing", "set_value"]);
+    expect(r.stepsExecuted).toBe(2);
+  });
+
+  it("returns the skipIf read as finalRead when the whole skill is already satisfied", async () => {
+    const readSkill: Skill = {
+      ...openSkill,
+      name: "read_thing",
+      params: [],
+      skipIf: { tool: "browser__eval", args: { expression: "probe_value" }, expectPattern: "[\\s\\S]*" },
+      steps: [{ tool: "browser__fill", args: { selector: "#search", value: "x" } }],
+    };
+    const store = makeStore([readSkill]);
+    const { mcp, policy, logger } = makeMocks(() => okResult('"12345"'));
+
+    const r = await replaySkill("read_thing", {}, { store, mcp, policy, logger });
+
+    expect(r.status).toBe("success");
+    expect(r.stepsExecuted).toBe(0);
+    expect(r.finalRead).toBe('"12345"');
+    expect(r.summary).toContain("nothing to do");
   });
 
   it("retries a post-condition read that races a slow render", async () => {

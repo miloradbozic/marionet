@@ -49,6 +49,14 @@ export interface ReplayOutcome {
   /** LLM calls made (0 on the happy path -- the product thesis, asserted in tests). */
   llmCalls: number;
   primitivesRun: string[];
+  /** Primitives whose skipIf matched: goal already achieved, steps not executed. */
+  primitivesSkipped: string[];
+  /**
+   * Result text of the last primitive's post-condition read. This is how
+   * read-only skills return data: their post-condition IS the read, and the
+   * caller (run_skill / CLI) gets the value instead of just pass/fail.
+   */
+  finalRead?: string;
 }
 
 interface PlanEntry {
@@ -103,7 +111,7 @@ export function resolvePlan(store: SkillStore, name: string, params: Record<stri
 export async function replaySkill(name: string, params: Record<string, string>, opts: ReplayEngineOptions): Promise<ReplayOutcome> {
   const confirm: ConfirmFn = opts.confirm ?? ((tool, args, rule, ctx) => confirmToolCall(tool, args, rule as never, ctx));
   const maxHeals = opts.maxHeals ?? 3;
-  const outcome: ReplayOutcome = { status: "success", summary: "", stepsExecuted: 0, healsApplied: 0, llmCalls: 0, primitivesRun: [] };
+  const outcome: ReplayOutcome = { status: "success", summary: "", stepsExecuted: 0, healsApplied: 0, llmCalls: 0, primitivesRun: [], primitivesSkipped: [] };
 
   let plan: PlanEntry[];
   try {
@@ -141,9 +149,49 @@ export async function replaySkill(name: string, params: Record<string, string>, 
     }
   };
 
+  // Look before you act: a skipIf probe that matches means the world is
+  // already in the state that primitive leaves behind. Returns the read text
+  // on match (it doubles as evidence / finalRead), null otherwise.
+  const checkSkipIf = async (entry: PlanEntry): Promise<string | null> => {
+    const probe = entry.skill.skipIf;
+    if (!probe) return null;
+    const args = substituteArgs(probe.args, entry.params);
+    const pattern = substitutePattern(probe.expectPattern, entry.params);
+    const r = await execute(probe.tool, args, `${entry.skill.name} skipIf`);
+    return r.ok && new RegExp(pattern).test(r.text) ? r.text : null;
+  };
+
   try {
-    for (const entry of plan) {
+    // Backward scan: find the LAST primitive whose goal already holds and
+    // resume after it — e.g. the right product page is already open, so the
+    // navigate + search primitives that would re-establish it are moot.
+    let startIdx = 0;
+    for (let j = plan.length - 1; j >= 0; j--) {
+      const text = await checkSkipIf(plan[j]!);
+      if (text !== null) {
+        startIdx = j + 1;
+        for (let k = 0; k <= j; k++) outcome.primitivesSkipped.push(plan[k]!.skill.name);
+        outcome.finalRead = text;
+        opts.logger.log({ type: "replay_skip", upTo: plan[j]!.skill.name, skipped: outcome.primitivesSkipped, resultText: text.slice(0, 500) });
+        break;
+      }
+    }
+
+    for (let i = startIdx; i < plan.length; i++) {
+      const entry = plan[i]!;
       const { skill } = entry;
+
+      // Same look-before-you-act check mid-flow: an earlier primitive may
+      // have already produced this one's goal state.
+      if (i > startIdx) {
+        const text = await checkSkipIf(entry);
+        if (text !== null) {
+          outcome.primitivesSkipped.push(skill.name);
+          outcome.finalRead = text;
+          opts.logger.log({ type: "replay_skip", upTo: skill.name, skipped: [skill.name], resultText: text.slice(0, 500) });
+          continue;
+        }
+      }
       outcome.primitivesRun.push(skill.name);
 
       for (let i = 0; i < skill.steps.length; i++) {
@@ -227,6 +275,7 @@ export async function replaySkill(name: string, params: Record<string, string>, 
         opts.logger.log({ type: "replay_finish", ...outcome });
         return outcome;
       }
+      outcome.finalRead = r.text;
     }
   } catch (err) {
     if (err instanceof ReplayBlocked) {
@@ -240,7 +289,11 @@ export async function replaySkill(name: string, params: Record<string, string>, 
     return outcome;
   }
 
-  outcome.summary = `replayed ${outcome.primitivesRun.join(" -> ")} (${outcome.stepsExecuted} steps, ${outcome.healsApplied} heal(s), ${outcome.llmCalls} LLM call(s))`;
+  const ran = outcome.primitivesRun.length ? `replayed ${outcome.primitivesRun.join(" -> ")}` : "nothing to do";
+  const skipped = outcome.primitivesSkipped.length ? `, skipped ${outcome.primitivesSkipped.join(" + ")} (already satisfied)` : "";
+  outcome.summary =
+    `${ran} (${outcome.stepsExecuted} steps, ${outcome.healsApplied} heal(s), ${outcome.llmCalls} LLM call(s)${skipped})` +
+    (outcome.finalRead !== undefined ? ` -- post-condition read: ${outcome.finalRead.slice(0, 300)}` : "");
   opts.logger.log({ type: "replay_finish", ...outcome });
   return outcome;
 }

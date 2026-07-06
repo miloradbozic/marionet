@@ -68,6 +68,19 @@ export interface Skill {
   description: string;
   params: SkillParam[];
   steps: SkillStep[];
+  /**
+   * Optional look-before-you-act check: a read-only probe that matches when
+   * the world is already in the state this primitive leaves behind, so replay
+   * can skip its steps ("the right product page is already open").
+   *
+   * Contract: the check must be self-sufficient — it must verify everything
+   * earlier primitives in a flow were needed for, not just this primitive's
+   * local effect, because the replay engine uses a matching skipIf to skip
+   * *predecessors* too (backward scan at replay start). A check that only
+   * holds "given the right page is open" must encode which page that is
+   * (e.g. via a {{param}}), or be omitted.
+   */
+  skipIf?: SkillPostCondition;
   postCondition: SkillPostCondition;
   source: SkillSource;
 }
