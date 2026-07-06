@@ -521,7 +521,11 @@ server.registerTool(
       for (let i = 0; i <= attempts; i++) {
         if ((await p.locator(selector).count()) > 0) {
           const identity = await describeBySelector(p, selector);
-          await p.locator(selector).scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+          // .first(): a selector legitimately matching >1 element (e.g. a
+          // measurement attribute's value + unit inputs under one row) must
+          // scroll the first, not strict-mode-error -- same rule as
+          // browser__reveal / browser__fill.
+          await p.locator(selector).first().scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
           await settle(p);
           return { content: [{ type: "text" as const, text: `Found ${selector} after ${i} scroll(s)${targetSuffix(identity)}` }] };
         }
