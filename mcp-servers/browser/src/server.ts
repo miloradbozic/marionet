@@ -376,6 +376,36 @@ server.registerTool(
 );
 
 server.registerTool(
+  "browser__set_files",
+  {
+    description:
+      "Attach one or more local files to a file input (e.g. a resume/CV upload field) -- the upload counterpart of browser__download. Reads the file(s) from disk and sets them on the <input type=file> the selector matches. Paths resolve relative to workspace/ unless absolute.",
+    inputSchema: {
+      selector: z.string().describe("CSS selector for the <input type=file>"),
+      paths: z.array(z.string()).min(1).describe("File paths to attach, relative to workspace/ unless absolute"),
+    },
+  },
+  async ({ selector, paths }) => {
+    try {
+      const p = await getPage();
+      const resolved = paths.map((sp) => (path.isAbsolute(sp) ? sp : path.resolve(WORKSPACE_ROOT, sp)));
+      // Fail with a clear message if a file is missing (e.g. the operator hasn't
+      // placed resume.pdf yet) instead of a generic Playwright element timeout.
+      for (const r of resolved) {
+        await fs.access(r).catch(() => {
+          throw new Error(`File not found: ${r}`);
+        });
+      }
+      await p.locator(selector).first().setInputFiles(resolved, { timeout: ACTION_TIMEOUT_MS });
+      await settle(p);
+      return { content: [{ type: "text" as const, text: `Attached ${resolved.join(", ")} to ${selector}` }] };
+    } catch (err) {
+      return errorResult(err);
+    }
+  },
+);
+
+server.registerTool(
   "browser__fill",
   {
     description:

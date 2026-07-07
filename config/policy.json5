@@ -2,14 +2,67 @@
 // Evaluated top-to-bottom; first matching rule wins. Unmatched tools are denied (fail-closed).
 // "match" is an exact tool id ("server__tool") or a glob ("gui__*").
 // "when.argsMatch.<field>" is a regex tested against String(args[field]).
+//
+// The shell rules below are a tripwire, not a sandbox: they catch the careless
+// destructive command (the 2026-07-04 ~/src wipe was `rm -rf` on a home path,
+// auto-allowed by the old catch-all), not a deliberately obfuscated one. Real
+// containment means running shell__exec in an OS-level sandbox (tier 2).
 {
   rules: [
-    // Catastrophic / hard-to-reverse local damage: ask even though shell is otherwise unattended.
+    // Recursive deletion aimed at an absolute path, ~, a $VAR, .. traversal, or
+    // a bare glob. Workspace-relative deletes (`rm -rf ./dist`) stay unattended.
     {
       match: "shell__exec",
       when: {
         argsMatch: {
-          command: "(rm\\s+-rf\\s+/(\\s|$|\\*)|mkfs|dd\\s+.*of=/dev/|:\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:|shutdown|reboot|poweroff|init\\s+0|curl[^|]*\\|\\s*(sh|bash)|wget[^|]*\\|\\s*(sh|bash))",
+          command: "\\brm\\s+[^|;&]*(-[a-zA-Z]*[rR]|--recursive)[^|;&]*\\s+[\"']?([/~*]|\\$|\\.\\.)",
+        },
+      },
+      action: "ask",
+    },
+    // Deletion by other means: find -delete/-exec rm, xargs rm, git clean.
+    {
+      match: "shell__exec",
+      when: {
+        argsMatch: {
+          command: "\\bfind\\s[^|;&]*\\s-(delete|exec\\s+rm)|\\bxargs\\b[^|;&]*\\brm\\b|\\bgit\\s+clean\\b",
+        },
+      },
+      action: "ask",
+    },
+    // Privilege escalation. An unattended browser-automation run has no
+    // legitimate reason to become root.
+    {
+      match: "shell__exec",
+      when: { argsMatch: { command: "(^|[\\s;&|(])(sudo|doas|pkexec)(\\s|$)" } },
+      action: "ask",
+    },
+    // Recursive ownership/permission changes on absolute, ~, or $VAR paths.
+    {
+      match: "shell__exec",
+      when: {
+        argsMatch: { command: "\\bch(mod|own|grp)\\s+[^|;&]*-[a-zA-Z]*R[^|;&]*\\s+[\"']?([/~]|\\$)" },
+      },
+      action: "ask",
+    },
+    // Catastrophic / hard-to-reverse local damage.
+    {
+      match: "shell__exec",
+      when: {
+        argsMatch: {
+          command: "\\bmkfs|\\bdd\\s+[^|;&]*of=/dev/|\\b(shred|wipefs)\\b|:\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};:|\\b(shutdown|reboot|poweroff)\\b|\\binit\\s+0|curl[^|]*\\|\\s*(sh|bash)|wget[^|]*\\|\\s*(sh|bash)",
+        },
+      },
+      action: "ask",
+    },
+    // The agent's own control plane and ambient credentials: policy files, run
+    // config, .env, shell rc files, ssh material, cron. Touching any of these
+    // from the shell needs a human.
+    {
+      match: "shell__exec",
+      when: {
+        argsMatch: {
+          command: "policy\\.json5|run\\.config\\.json|(^|[\\s/\"'=])\\.env\\b|\\.(bashrc|zshrc|profile)\\b|\\.ssh\\b|authorized_keys|\\bcrontab\\b",
         },
       },
       action: "ask",
@@ -20,10 +73,17 @@
       when: { argsMatch: { command: "git\\s+push" } },
       action: "ask",
     },
-    // Everything else, including sudo, runs unattended.
+    // Everything else runs unattended.
     { match: "shell__exec", action: "allow" },
 
+    { match: "fs__read", when: { argsMatch: { path: "\\.env(\\.|$)|\\.ssh/|\\.aws/|\\.gnupg/|id_rsa" } }, action: "ask" },
     { match: "fs__read", action: "allow" },
+    // The agent may never rewrite the policy that gates it -- not even with
+    // human confirmation; a human who wants that edits the file themselves.
+    { match: "fs__write", when: { argsMatch: { path: "policy\\.json5" } }, action: "deny" },
+    // Writes outside workspace/ (absolute paths, ~, or ..-traversal) need a
+    // human. Relative paths resolve against workspace/ in the core server.
+    { match: "fs__write", when: { argsMatch: { path: "^[/~]|(^|/)\\.\\.(/|$)" } }, action: "ask" },
     { match: "fs__write", action: "allow" },
     { match: "fs__list", action: "allow" },
 
@@ -48,7 +108,14 @@
     { match: "browser__extract", action: "allow" },
     { match: "browser__enumerate", action: "allow" },
     { match: "browser__download", action: "allow" },
+    // Attaching a local file to a form input isn't an external send -- only the
+    // subsequent submit_form is. Allow unattended; the human checkpoint is submit.
+    { match: "browser__set_files", action: "allow" },
     { match: "browser__submit_form", action: "allow" },
+    // eval stays allowed globally because every compiled skill verifies its
+    // post-condition through it -- an ask here would stall zero-LLM replays.
+    // Clients that browse arbitrary external pages (prompt-injection surface)
+    // should override this to "ask" in their client policy; job-apply does.
     { match: "browser__eval", action: "allow" },
     { match: "browser__wait_for", action: "allow" },
 
