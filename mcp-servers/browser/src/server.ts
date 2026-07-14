@@ -297,10 +297,10 @@ server.registerTool(
   "browser__extract",
   {
     description:
-      "Read content from the current page: visible text, raw HTML, or a screenshot. Defaults to the whole page if no selector given.",
+      "Read content from the current page: visible text, raw HTML, an input's current value, or a screenshot. Defaults to the whole page if no selector given. format \"value\" (requires a selector) reads the value of an <input>/<textarea>/<select> -- text/innerText excludes input values, so \"value\" is the read-only way to verify a filled field without browser__eval.",
     inputSchema: {
       selector: z.string().optional(),
-      format: z.enum(["text", "html", "screenshot"]).optional().describe("Default: text"),
+      format: z.enum(["text", "html", "value", "screenshot"]).optional().describe("Default: text"),
     },
   },
   async ({ selector, format }) => {
@@ -316,6 +316,14 @@ server.registerTool(
           ? await p.locator(selector).screenshot({ timeout: ACTION_TIMEOUT_MS })
           : await p.screenshot();
         return { content: [{ type: "image" as const, data: buffer.toString("base64"), mimeType: "image/png" }] };
+      }
+      if (fmt === "value") {
+        if (!selector) return errorResult(new Error('format "value" requires a selector (it reads one input/textarea/select)'));
+        // .first(): a row can legitimately hold more than one input (an Akeneo
+        // measurement attribute's value + unit), and the fill side already
+        // takes the first match -- the read must agree with the write.
+        const value = await p.locator(selector).first().inputValue({ timeout: ACTION_TIMEOUT_MS });
+        return { content: [{ type: "text" as const, text: value }] };
       }
       const locator = selector ? p.locator(selector) : p.locator("body");
       const text =

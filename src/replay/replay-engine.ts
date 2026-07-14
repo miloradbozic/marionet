@@ -2,7 +2,7 @@ import type { McpClientManager, McpToolResult } from "../mcp/mcp-client-manager.
 import type { PolicyEngine } from "../policy/policy-engine.js";
 import type { RunLogger } from "../logging/run-logger.js";
 import { confirmToolCall } from "../confirm/cli-prompt.js";
-import { isFlowSkill, type Skill, type SkillStep } from "../compiler/skill.types.js";
+import { healCount, isFlowSkill, REEXPLORE_HEAL_THRESHOLD, renderLineage, type LineageEntry, type Skill, type SkillStep } from "../compiler/skill.types.js";
 import { ParamError, substituteArgs, substitutePattern, substituteString } from "./params.js";
 import type { SkillStore } from "./skill-store.js";
 import type { Healer } from "./heal.js";
@@ -52,6 +52,11 @@ export interface ReplayOutcome {
   /** Primitives whose skipIf matched: goal already achieved, steps not executed. */
   primitivesSkipped: string[];
   /**
+   * Skills whose lineage has now accumulated enough heals that re-exploring
+   * beats patching (P25). Advisory: surfaced to the operator, never acted on.
+   */
+  reExploreProposed: string[];
+  /**
    * Result text of the last primitive's post-condition read. This is how
    * read-only skills return data: their post-condition IS the read, and the
    * caller (run_skill / CLI) gets the value instead of just pass/fail.
@@ -81,6 +86,54 @@ const POST_CONDITION_RETRIES = 3;
 const SEMANTIC_TOOLS = new Set(["browser__click", "browser__fill"]);
 
 /**
+ * Tools that cannot change the system of record. Fail-closed allowlist: a tool
+ * is read-only only if named here, so a new verb is inert until someone
+ * classifies it deliberately.
+ *
+ * Deliberately excluded even though they look harmless: `browser__click` and
+ * `browser__reveal` (a click is a save as often as it is a tab switch, and the
+ * step can't tell us which) and `browser__eval` (arbitrary JS -- it can do
+ * anything a write can).
+ */
+const READ_ONLY_TOOLS = new Set([
+  "browser__navigate",
+  "browser__snapshot",
+  "browser__extract",
+  "browser__enumerate",
+  "browser__wait_for",
+  "browser__scroll",
+  "browser__scroll_until_visible",
+  "fs__read",
+  "fs__list",
+]);
+
+export interface PrefixStep {
+  skill: Skill;
+  stepIndex: number;
+  step: SkillStep;
+  params: Record<string, string>;
+}
+
+/**
+ * The leading run of read-only steps across a plan -- attach, navigate, locate
+ * -- stopping at the first step that could write.
+ *
+ * This is what a warm-up executes: it exercises exactly the two things that
+ * break between a skill's last good run and this one (the session died, the
+ * page was redesigned) and nothing that could be regretted if they have.
+ */
+export function readOnlyPrefix(plan: PlanEntry[]): PrefixStep[] {
+  const prefix: PrefixStep[] = [];
+  for (const entry of plan) {
+    for (const [stepIndex, step] of entry.skill.steps.entries()) {
+      if (!READ_ONLY_TOOLS.has(step.tool)) return prefix;
+      prefix.push({ skill: entry.skill, stepIndex, step, params: entry.params });
+    }
+  }
+  return prefix;
+}
+
+/**
  * Semantic-first: anchor on role + accessible name when a locator is present
  * and the tool supports it; the recorded/patched args are the second chance,
  * not the primary anchor. Shared by original steps AND healed patches -- a
@@ -106,6 +159,112 @@ function buildAttempts(
 }
 
 class ReplayBlocked extends Error {}
+
+type Executor = (tool: string, args: Record<string, unknown>, context: string) => Promise<{ ok: boolean; text: string }>;
+
+/**
+ * Gated + logged tool execution, shared by steps, heal patches,
+ * post-conditions, and warm-ups. Every path into a tool goes through here, so
+ * a replayed action is gated and audited exactly like a model-proposed one --
+ * there is no trusted path that skips the policy engine.
+ */
+function makeExecutor(opts: ReplayEngineOptions, confirm: ConfirmFn): Executor {
+  return async (tool, args, context) => {
+    const decision = opts.policy.evaluate(tool, args);
+    opts.logger.log({ type: "policy_decision", tool, action: decision.action, matchedRule: decision.matchedRule, context });
+    if (decision.action === "deny") {
+      throw new ReplayBlocked(`step tool "${tool}" is denied by policy`);
+    }
+    if (decision.action === "ask") {
+      const confirmation = await confirm(tool, args, decision.matchedRule, context);
+      opts.logger.log({ type: "human_decision", tool, decision: confirmation.approved ? "approved" : "denied", note: confirmation.note });
+      if (!confirmation.approved) throw new ReplayBlocked(`step tool "${tool}" was denied by the human operator`);
+    }
+    const start = Date.now();
+    try {
+      const result = await opts.mcp.callTool(tool, args);
+      const text = textOfResult(result);
+      opts.logger.log({ type: "replay_step", context, tool, args, isError: Boolean(result.isError), durationMs: Date.now() - start, resultText: text.slice(0, 1000) });
+      return { ok: !result.isError, text };
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      opts.logger.log({ type: "replay_step", context, tool, args, isError: true, durationMs: Date.now() - start, resultText: text.slice(0, 1000) });
+      return { ok: false, text };
+    }
+  };
+}
+
+export interface WarmUpOutcome {
+  ok: boolean;
+  summary: string;
+  stepsRun: number;
+}
+
+/**
+ * Pre-flight for a batch: execute the skill's read-only prefix once, minutes
+ * before the real thing, so drift is met before the first write rather than at
+ * row 117 of 300.
+ *
+ * This is deliberately not a scheduled sentinel probing client systems at 3am
+ * -- it is part of the imminent run, costs one page load, and catches the two
+ * failures that actually happen between batches: the session expired, or the
+ * page was redesigned. A failure here aborts the batch with nothing written.
+ */
+export async function warmUpSkill(name: string, params: Record<string, string>, opts: ReplayEngineOptions): Promise<WarmUpOutcome> {
+  const confirm: ConfirmFn = opts.confirm ?? ((tool, args, rule, ctx) => confirmToolCall(tool, args, rule as never, ctx));
+  const execute = makeExecutor(opts, confirm);
+
+  let plan: PlanEntry[];
+  try {
+    plan = resolvePlan(opts.store, name, params);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    opts.logger.log({ type: "warmup_finish", skill: name, ok: false, error: msg });
+    return { ok: false, summary: msg, stepsRun: 0 };
+  }
+
+  const prefix = readOnlyPrefix(plan);
+  opts.logger.log({ type: "warmup_start", skill: name, params, prefixLength: prefix.length });
+  if (!prefix.length) {
+    const summary = "skill has no read-only prefix to warm up (its first step already writes)";
+    opts.logger.log({ type: "warmup_finish", skill: name, ok: true, stepsRun: 0, note: summary });
+    return { ok: true, summary, stepsRun: 0 };
+  }
+
+  let stepsRun = 0;
+  try {
+    for (const { skill, stepIndex, step, params: stepParams } of prefix) {
+      const ctx = `warmup ${skill.name}[${stepIndex}]`;
+      const args = substituteArgs(step.args, stepParams);
+      const attempts = buildAttempts(step.tool, args, step.locator, stepParams);
+
+      let ok = false;
+      let lastError = "";
+      for (const attempt of attempts) {
+        const r = await execute(step.tool, attempt.args, `${ctx} (${attempt.kind})`);
+        if (r.ok) {
+          ok = true;
+          break;
+        }
+        lastError = r.text;
+      }
+      if (!ok) {
+        const summary = `warm-up failed at ${ctx} (${step.tool}): ${lastError.slice(0, 300)}`;
+        opts.logger.log({ type: "warmup_finish", skill: name, ok: false, stepsRun, error: summary });
+        return { ok: false, summary, stepsRun };
+      }
+      stepsRun++;
+    }
+  } catch (err) {
+    const summary = err instanceof Error ? err.message : String(err);
+    opts.logger.log({ type: "warmup_finish", skill: name, ok: false, stepsRun, error: summary });
+    return { ok: false, summary, stepsRun };
+  }
+
+  const summary = `warm-up ok (${stepsRun} read-only step(s): session alive, page still matches the skill)`;
+  opts.logger.log({ type: "warmup_finish", skill: name, ok: true, stepsRun });
+  return { ok: true, summary, stepsRun };
+}
 
 function textOfResult(result: McpToolResult): string {
   return result.content
@@ -144,7 +303,7 @@ export function resolvePlan(store: SkillStore, name: string, params: Record<stri
 export async function replaySkill(name: string, params: Record<string, string>, opts: ReplayEngineOptions): Promise<ReplayOutcome> {
   const confirm: ConfirmFn = opts.confirm ?? ((tool, args, rule, ctx) => confirmToolCall(tool, args, rule as never, ctx));
   const maxHeals = opts.maxHeals ?? 3;
-  const outcome: ReplayOutcome = { status: "success", summary: "", stepsExecuted: 0, healsApplied: 0, llmCalls: 0, primitivesRun: [], primitivesSkipped: [] };
+  const outcome: ReplayOutcome = { status: "success", summary: "", stepsExecuted: 0, healsApplied: 0, llmCalls: 0, primitivesRun: [], primitivesSkipped: [], reExploreProposed: [] };
 
   let plan: PlanEntry[];
   try {
@@ -157,30 +316,7 @@ export async function replaySkill(name: string, params: Record<string, string>, 
 
   opts.logger.log({ type: "replay_start", skill: name, params, plan: plan.map((e) => e.skill.name) });
 
-  // Gated + logged tool execution shared by steps, patches, and post-conditions.
-  const execute = async (tool: string, args: Record<string, unknown>, context: string): Promise<{ ok: boolean; text: string }> => {
-    const decision = opts.policy.evaluate(tool, args);
-    opts.logger.log({ type: "policy_decision", tool, action: decision.action, matchedRule: decision.matchedRule, context });
-    if (decision.action === "deny") {
-      throw new ReplayBlocked(`step tool "${tool}" is denied by policy`);
-    }
-    if (decision.action === "ask") {
-      const confirmation = await confirm(tool, args, decision.matchedRule, context);
-      opts.logger.log({ type: "human_decision", tool, decision: confirmation.approved ? "approved" : "denied", note: confirmation.note });
-      if (!confirmation.approved) throw new ReplayBlocked(`step tool "${tool}" was denied by the human operator`);
-    }
-    const start = Date.now();
-    try {
-      const result = await opts.mcp.callTool(tool, args);
-      const text = textOfResult(result);
-      opts.logger.log({ type: "replay_step", context, tool, args, isError: Boolean(result.isError), durationMs: Date.now() - start, resultText: text.slice(0, 1000) });
-      return { ok: !result.isError, text };
-    } catch (err) {
-      const text = err instanceof Error ? err.message : String(err);
-      opts.logger.log({ type: "replay_step", context, tool, args, isError: true, durationMs: Date.now() - start, resultText: text.slice(0, 1000) });
-      return { ok: false, text };
-    }
-  };
+  const execute = makeExecutor(opts, confirm);
 
   // Look before you act: a skipIf probe that matches means the world is
   // already in the state that primitive leaves behind. Returns the read text
@@ -267,7 +403,7 @@ export async function replaySkill(name: string, params: Record<string, string>, 
               lastError = r.text;
             }
             if (healed) {
-              persistPatch(opts.store, skill.name, i, patched, opts.logger);
+              persistPatch(opts.store, skill.name, i, patched, opts.logger, outcome);
               outcome.healsApplied++;
               ok = true;
             }
@@ -324,9 +460,13 @@ export async function replaySkill(name: string, params: Record<string, string>, 
 
   const ran = outcome.primitivesRun.length ? `replayed ${outcome.primitivesRun.join(" -> ")}` : "nothing to do";
   const skipped = outcome.primitivesSkipped.length ? `, skipped ${outcome.primitivesSkipped.join(" + ")} (already satisfied)` : "";
+  const reExplore = outcome.reExploreProposed.length
+    ? `\n     re-explore proposed: ${outcome.reExploreProposed.join(", ")} -- ${REEXPLORE_HEAL_THRESHOLD}+ heals in its lineage; the site has drifted enough that re-learning beats patching.`
+    : "";
   outcome.summary =
     `${ran} (${outcome.stepsExecuted} steps, ${outcome.healsApplied} heal(s), ${outcome.llmCalls} LLM call(s)${skipped})` +
-    (outcome.finalRead !== undefined ? ` -- post-condition read: ${outcome.finalRead.slice(0, 300)}` : "");
+    (outcome.finalRead !== undefined ? ` -- post-condition read: ${outcome.finalRead.slice(0, 300)}` : "") +
+    reExplore;
   opts.logger.log({ type: "replay_finish", ...outcome });
   return outcome;
 }
@@ -369,11 +509,67 @@ async function heal(
   }
 }
 
-/** Write the patch back so one heal fixes every flow that uses this skill. */
-function persistPatch(store: SkillStore, skillName: string, stepIndex: number, patched: SkillStep, logger: RunLogger): void {
+/**
+ * What a step now aims at, for the lineage note -- the whole point of the
+ * entry is telling a human what changed, and "step 1 healed (browser__click)"
+ * doesn't. Reads role+name from either `locator` or `args`: the heal LLM fills
+ * one or the other, not reliably both (the same asymmetry buildAttempts
+ * compensates for), so a note that only reads `locator` goes blank exactly
+ * when the patch was a semantic re-grounding -- the interesting case.
+ */
+function describeTarget(step: SkillStep): string {
+  const role = step.locator?.role ?? (typeof step.args.role === "string" ? step.args.role : undefined);
+  const name = step.locator?.name ?? (typeof step.args.name === "string" ? step.args.name : undefined);
+  if (role && name) return ` -> ${role} "${name}"`;
+  const selector = typeof step.args.selector === "string" ? step.args.selector : undefined;
+  return selector ? ` -> ${selector}` : "";
+}
+
+/**
+ * Write the patch back so one heal fixes every flow that uses this skill, and
+ * append the heal to the skill's lineage: the file now differs from what the
+ * exploration run compiled, and the next person to debug it needs to know
+ * which hand changed what.
+ *
+ * A skill that has needed REEXPLORE_HEAL_THRESHOLD heals is no longer drifting
+ * -- the site has moved out from under it, and patching step-by-step now costs
+ * more than re-learning the flow. That verdict is logged and surfaced in the
+ * replay summary rather than acted on: re-exploration spends a strong model
+ * and wants a human who chose it.
+ */
+function persistPatch(
+  store: SkillStore,
+  skillName: string,
+  stepIndex: number,
+  patched: SkillStep,
+  logger: RunLogger,
+  outcome: ReplayOutcome,
+): void {
   const fresh = store.load(skillName);
   if (isFlowSkill(fresh)) return; // defensive; only primitives reach here
   fresh.steps[stepIndex] = patched;
+
+  const entry: LineageEntry = {
+    type: "heal",
+    at: new Date().toISOString(),
+    note: `step ${stepIndex} healed (${patched.tool}${describeTarget(patched)}, auto-verified) in run ${logger.runId}`,
+    runId: logger.runId,
+    stepIndex,
+  };
+  fresh.lineage = [...(fresh.lineage ?? []), entry];
+
   const path = store.save(fresh);
-  logger.log({ type: "heal_applied", skill: skillName, stepIndex, path });
+  logger.log({ type: "heal_applied", skill: skillName, stepIndex, path, lineage: renderLineage(fresh.lineage) });
+
+  const heals = healCount(fresh.lineage);
+  if (heals >= REEXPLORE_HEAL_THRESHOLD && !outcome.reExploreProposed.includes(skillName)) {
+    outcome.reExploreProposed.push(skillName);
+    logger.log({
+      type: "reexplore_proposed",
+      skill: skillName,
+      heals,
+      threshold: REEXPLORE_HEAL_THRESHOLD,
+      lineage: renderLineage(fresh.lineage),
+    });
+  }
 }

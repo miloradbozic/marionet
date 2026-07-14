@@ -112,10 +112,13 @@
     // subsequent submit_form is. Allow unattended; the human checkpoint is submit.
     { match: "browser__set_files", action: "allow" },
     { match: "browser__submit_form", action: "allow" },
-    // eval stays allowed globally because every compiled skill verifies its
-    // post-condition through it -- an ask here would stall zero-LLM replays.
-    // Clients that browse arbitrary external pages (prompt-injection surface)
-    // should override this to "ask" in their client policy; job-apply does.
+    // eval is no longer the verification path: browser__extract (format
+    // "value"/"text") reads back durable state read-only, so a skill compiled
+    // today replays unattended even on a client that gates eval to "ask" for
+    // prompt-injection reasons (job-apply does). eval stays allowed globally
+    // for reads extract can't express -- and because skills compiled before
+    // extract existed still verify through it. Clients that browse arbitrary
+    // external pages should override this to "ask" in their client policy.
     { match: "browser__eval", action: "allow" },
     { match: "browser__wait_for", action: "allow" },
 

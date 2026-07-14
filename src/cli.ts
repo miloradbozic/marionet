@@ -14,10 +14,10 @@ import { llmSegmenter, monolithSegmenter, type Segmenter } from "./compiler/segm
 import { parseEvents } from "./compiler/trajectory.js";
 import { writeSkillFiles, appendPlaybookNotes } from "./compiler/emit.js";
 import { SkillStore } from "./replay/skill-store.js";
-import { replaySkill } from "./replay/replay-engine.js";
+import { replaySkill, warmUpSkill } from "./replay/replay-engine.js";
 import { llmHealer, type Healer } from "./replay/heal.js";
 import type { SkillRunner } from "./loop/run-skill-tool.js";
-import { isFlowSkill } from "./compiler/skill.types.js";
+import { healCount, isFlowSkill, REEXPLORE_HEAL_THRESHOLD, renderLineage } from "./compiler/skill.types.js";
 import {
   filterEnvForClient,
   loadClientProfile,
@@ -357,7 +357,24 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
   );
 
   let failures = 0;
+  let warmUpAborted = false;
   try {
+    // Warm-up before a batch: run the read-only prefix once so a dead session
+    // or a redesigned page surfaces now, with nothing written, instead of at
+    // row 117 of 300. Single-row replays skip it -- the row itself is the
+    // warm-up, and paying for a second page load to learn what the next step
+    // is about to tell us is waste.
+    if (rows.length > 1) {
+      const w = await warmUpSkill(cliArgs.skillName, rows[0]!, { store, mcp, policy, logger, healer });
+      console.log(`${w.ok ? "ok  " : "FAIL"} ${w.summary}`);
+      if (!w.ok) {
+        console.error(`\nAborting batch of ${rows.length} rows: the warm-up failed, so nothing was written.`);
+        console.error(`Fix the cause (re-authenticate in your browser, or heal/re-explore the skill) and re-run.`);
+        warmUpAborted = true;
+        return;
+      }
+    }
+
     for (const [i, params] of rows.entries()) {
       if (rows.length > 1) console.log(`\n--- row ${i + 1}/${rows.length}: ${JSON.stringify(params)}`);
       const r = await replaySkill(cliArgs.skillName, params, { store, mcp, policy, logger, healer });
@@ -365,12 +382,13 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
       console.log(`${r.status === "success" ? "ok " : "FAIL"} ${r.summary}`);
     }
   } finally {
-    const status = failures === 0 ? "success" : "failure";
-    logger.finalize(status);
-    if (rows.length > 1) console.log(`\n${rows.length - failures}/${rows.length} rows succeeded`);
+    const ok = failures === 0 && !warmUpAborted;
+    logger.finalize(ok ? "success" : "failure");
+    if (warmUpAborted) console.log(`\n0/${rows.length} rows attempted (warm-up failed before the first write)`);
+    else if (rows.length > 1) console.log(`\n${rows.length - failures}/${rows.length} rows succeeded`);
     console.log(`log: ${logger.runDir}`);
     await mcp.closeAll();
-    process.exit(failures === 0 ? 0 : 1);
+    process.exit(ok ? 0 : 1);
   }
 }
 
@@ -387,6 +405,10 @@ function skillsCommand(repoRoot: string, clientName: string | undefined): void {
     console.log(`${kind}  ${s.name}(${params})`);
     console.log(`           ${s.description}`);
     if (isFlowSkill(s)) console.log(`           calls: ${s.calls.map((c) => c.skill).join(" -> ")}`);
+    console.log(`           lineage: ${renderLineage(s.lineage)}`);
+    if (healCount(s.lineage) >= REEXPLORE_HEAL_THRESHOLD) {
+      console.log(`           ^ ${healCount(s.lineage)} heals -- consider re-exploring this flow instead of patching it further.`);
+    }
   }
 }
 

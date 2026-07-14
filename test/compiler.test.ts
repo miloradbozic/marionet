@@ -12,6 +12,7 @@ import {
 import { detectLiterals, buildMapping, parameterizeStep, parameterizePostCondition } from "../src/compiler/parameterize.js";
 import { compileRun } from "../src/compiler/compile.js";
 import { monolithSegmenter, validateSegmentation, type Segmenter, type Segmentation } from "../src/compiler/segment.js";
+import { healCount } from "../src/compiler/skill.types.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtureEvents = parseEvents(readFileSync(path.join(here, "fixtures", "akeneo-set-ean.events.jsonl"), "utf-8"));
@@ -243,6 +244,27 @@ describe("compileRun", () => {
     ]);
     expect(result.flow!.params.map((p) => p.name).sort()).toEqual(["ean", "sku"]);
     expect(result.playbookNotes).toEqual(["Product grid search fires only on Enter, not on input."]);
+  });
+
+  it("stamps every compiled skill with an explored lineage root", async () => {
+    const result = await compileRun({
+      events: fixtureEvents,
+      runId: "test-run",
+      task: TASK,
+      model: "test-model",
+      client: "opari",
+      metaStatus: "success",
+      segmenter: twoSegmentSegmenter,
+    });
+
+    for (const skill of [...result.primitives, result.flow!]) {
+      expect(skill.lineage).toHaveLength(1);
+      const root = skill.lineage![0]!;
+      expect(root.type).toBe("explored");
+      expect(root.runId).toBe("test-run");
+      expect(root.note).toContain("test-run");
+      expect(healCount(skill.lineage)).toBe(0); // a fresh skill has no scar tissue
+    }
   });
 
   it("falls back to a monolith when the segmentation is invalid (rogue paramNames)", async () => {

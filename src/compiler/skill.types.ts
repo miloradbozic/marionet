@@ -60,6 +60,47 @@ export interface SkillSource {
   compiledAt: string;
 }
 
+/**
+ * One event in a skill's history: how it came to be the way it is. A skill
+ * that has been healed twice and hand-patched once is not the same artifact
+ * the exploration run produced, and "which of these hands broke it?" is
+ * un-answerable from the JSON alone -- the state is recorded, the *becoming*
+ * is not. Every write to a skill file appends an entry here.
+ *
+ * Types carry different trust weight: `explored` came from a verified run,
+ * `heal` from an LLM patch that passed its post-condition, `human` from a
+ * person editing directly.
+ */
+export interface LineageEntry {
+  type: "explored" | "heal" | "human";
+  /** ISO timestamp. */
+  at: string;
+  /** One human-readable line, rendered as-is by `marionet skills`. */
+  note: string;
+  /** The run that produced this entry (the exploration run, or the replay that healed). */
+  runId?: string;
+  /** Which step a heal/human patch replaced. */
+  stepIndex?: number;
+}
+
+/**
+ * Heals in a skill's lineage before patching stops being the cheap answer.
+ * At this depth the site has drifted enough that re-learning it beats
+ * accumulating scar tissue (P25: drift is data).
+ */
+export const REEXPLORE_HEAL_THRESHOLD = 3;
+
+/** Heals recorded in this skill's lineage, the argument for re-exploring. */
+export function healCount(lineage: LineageEntry[] | undefined): number {
+  return (lineage ?? []).filter((e) => e.type === "heal").length;
+}
+
+/** Renders a lineage as the one-line chain `marionet skills` and replay banners show. */
+export function renderLineage(lineage: LineageEntry[] | undefined): string {
+  if (!lineage?.length) return "(no lineage recorded)";
+  return lineage.map((e) => e.note).join(" -> ");
+}
+
 export interface Skill {
   /** Absent means "primitive" (backward compat with pre-segmentation files). */
   kind?: "primitive";
@@ -83,6 +124,8 @@ export interface Skill {
   skipIf?: SkillPostCondition;
   postCondition: SkillPostCondition;
   source: SkillSource;
+  /** How this skill came to be: compiled, then every heal/human patch since. */
+  lineage?: LineageEntry[];
 }
 
 /** One composed call inside a flow; param values may contain {{param}} placeholders. */
@@ -99,6 +142,8 @@ export interface FlowSkill {
   params: SkillParam[];
   calls: FlowCall[];
   source: SkillSource;
+  /** How this skill came to be: compiled, then every heal/human patch since. */
+  lineage?: LineageEntry[];
 }
 
 export type AnySkill = Skill | FlowSkill;

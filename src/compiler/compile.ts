@@ -1,7 +1,7 @@
 import { detectLiterals, buildMapping, parameterizeStep, parameterizePostCondition } from "./parameterize.js";
 import { assertCompilable, extractTrajectory, type RunEvent } from "./trajectory.js";
 import { monolithSegmenter, validateSegmentation, type Segmentation, type Segmenter } from "./segment.js";
-import type { FlowSkill, Skill, SkillParam, SkillPostCondition, SkillSource, SkillStep } from "./skill.types.js";
+import type { FlowSkill, LineageEntry, Skill, SkillParam, SkillPostCondition, SkillSource, SkillStep } from "./skill.types.js";
 
 export interface CompileInput {
   events: RunEvent[];
@@ -67,6 +67,17 @@ export async function compileRun(input: CompileInput): Promise<CompileResult> {
     compiledAt: new Date().toISOString(),
   };
 
+  // The root of the lineage chain: every later heal/human patch appends to it,
+  // so a skill can always answer "who made you this way?".
+  const rootLineage = (): LineageEntry[] => [
+    {
+      type: "explored",
+      at: source.compiledAt,
+      note: `explored from run ${input.runId} (verified)`,
+      runId: input.runId,
+    },
+  ];
+
   const paramsUsedIn = (json: string): SkillParam[] =>
     literals.filter((lit) => json.includes(`{{${nameFor(lit)}}}`)).map((lit) => ({ name: nameFor(lit), example: lit }));
 
@@ -83,6 +94,7 @@ export async function compileRun(input: CompileInput): Promise<CompileResult> {
       steps: segSteps,
       postCondition: post,
       source,
+      lineage: rootLineage(),
     };
   });
 
@@ -99,6 +111,7 @@ export async function compileRun(input: CompileInput): Promise<CompileResult> {
         params: Object.fromEntries(p.params.map((param) => [param.name, `{{${param.name}}}`])),
       })),
       source,
+      lineage: rootLineage(),
     };
   }
 

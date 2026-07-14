@@ -180,9 +180,13 @@ describe.skipIf(!chromeAvailable)("golden loop (integration)", () => {
           input: {
             status: "success",
             summary: "EAN set on product 1001.",
+            // Read-only verification: extract format:"value" reads the input's
+            // current value without eval. This is the path the prompts steer
+            // to, so the loop proves it end-to-end -- the compiled skill's
+            // post-condition inherits it and every replay below re-runs it.
             verification: {
-              tool: "browser__eval",
-              args: { expression: "document.querySelector('#ean-field').value" },
+              tool: "browser__extract",
+              args: { selector: "#ean-field", format: "value" },
               expectPattern: "4006381333931",
             },
           },
@@ -272,6 +276,12 @@ describe.skipIf(!chromeAvailable)("golden loop (integration)", () => {
     // The patch was persisted into the skill file...
     const onDisk = JSON.parse(readFileSync(store.pathOf("set_product_ean"), "utf-8")) as Skill;
     expect(onDisk.steps.find((s) => s.tool === "browser__click")!.args).toEqual({ role: "button", name: "Save changes" });
+
+    // ...and the skill records that a hand other than the compiler shaped it:
+    // the explored root survives, the heal is appended and typed.
+    expect(onDisk.lineage!.map((e) => e.type)).toEqual(["explored", "heal"]);
+    expect(onDisk.lineage!.at(-1)!.note).toContain("Save changes");
+    expect(healed.reExploreProposed).toEqual([]); // one heal is drift, not a verdict
 
     // ...so the next replay needs no LLM at all.
     const loggerAfter = makeLogger("replay set_ean_for_product sku=3003 (after heal)");

@@ -34,7 +34,7 @@ export const FINISH_TASK_TOOL: OpenAI.ChatCompletionTool = {
   function: {
     name: FINISH_TASK_TOOL_NAME,
     description:
-      'Call this when the task is complete, or when you determine it cannot be completed. This is the only way to end the run -- do not just stop responding or produce a final text-only answer. Ending with status "success" REQUIRES a verification: a read-only tool call (e.g. browser__eval reading an input value, fs__read, a read-only shell command) that the system will execute to independently confirm the outcome. If the verification does not match, the run does not end and you must fix the problem or finish with status "failure".',
+      'Call this when the task is complete, or when you determine it cannot be completed. This is the only way to end the run -- do not just stop responding or produce a final text-only answer. Ending with status "success" REQUIRES a verification: a read-only tool call (e.g. browser__extract with format "value" reading an input value, fs__read, a read-only shell command) that the system will execute to independently confirm the outcome. If the verification does not match, the run does not end and you must fix the problem or finish with status "failure".',
     parameters: {
       type: "object",
       properties: {
@@ -48,7 +48,8 @@ export const FINISH_TASK_TOOL: OpenAI.ChatCompletionTool = {
           properties: {
             tool: {
               type: "string",
-              description: "Name of a read-only tool to execute, e.g. browser__eval, fs__read, shell__exec",
+              description:
+                'Name of a read-only tool to execute. Prefer browser__extract (format "value" for input values, "text" for visible text) over browser__eval -- extract is read-only by construction and stays allowed where eval is gated. Also: fs__read, shell__exec.',
             },
             args: {
               type: "object",

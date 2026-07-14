@@ -3,10 +3,10 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { SkillStore } from "../src/replay/skill-store.js";
-import { replaySkill, resolvePlan, type ReplayEngineOptions } from "../src/replay/replay-engine.js";
+import { readOnlyPrefix, replaySkill, resolvePlan, warmUpSkill, type ReplayEngineOptions } from "../src/replay/replay-engine.js";
 import { substituteArgs, substitutePattern, substituteString, ParamError } from "../src/replay/params.js";
 import { validatePatch, HealError, type Healer } from "../src/replay/heal.js";
-import type { Skill, FlowSkill } from "../src/compiler/skill.types.js";
+import { healCount, REEXPLORE_HEAL_THRESHOLD, renderLineage, type LineageEntry, type Skill, type FlowSkill } from "../src/compiler/skill.types.js";
 import type { McpClientManager, McpToolResult } from "../src/mcp/mcp-client-manager.js";
 import type { PolicyEngine } from "../src/policy/policy-engine.js";
 import type { RunLogger } from "../src/logging/run-logger.js";
@@ -40,6 +40,8 @@ function makeMocks(handler: (tool: string, args: Record<string, unknown>) => Mcp
       { type: "function", function: { name: "browser__fill" } },
       { type: "function", function: { name: "browser__click" } },
       { type: "function", function: { name: "browser__eval" } },
+      { type: "function", function: { name: "browser__extract" } },
+      { type: "function", function: { name: "browser__navigate" } },
       { type: "function", function: { name: "browser__snapshot" } },
     ],
     callTool: async (tool: string, args: Record<string, unknown>) => {
@@ -49,7 +51,7 @@ function makeMocks(handler: (tool: string, args: Record<string, unknown>) => Mcp
   } as unknown as McpClientManager;
   const policy = { evaluate: () => ({ action: "allow", matchedRule: { match: "*", action: "allow" } }) } as unknown as PolicyEngine;
   const events: Array<Record<string, unknown>> = [];
-  const logger = { log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
+  const logger = { runId: "test-run", log: (e: Record<string, unknown>) => events.push(e) } as unknown as RunLogger;
   return { mcp, policy, logger, calls, events };
 }
 
@@ -365,6 +367,160 @@ describe("self-heal", () => {
     const r = await replaySkill("set_value", { value: "x" }, { store, mcp, policy, logger });
     expect(r.status).toBe("failure");
     expect(r.summary).toContain("set_value[0]");
+  });
+});
+
+describe("lineage", () => {
+  const healingMocks = () =>
+    makeMocks((tool, args) => {
+      if (tool === "browser__fill" && args.selector === "#value") return errResult("selector not found");
+      if (tool === "browser__fill" && args.role === "textbox") return okResult("Filled");
+      if (tool === "browser__snapshot") return okResult('e1 textbox "Value"');
+      if (tool === "browser__eval") return okResult('"fixed"');
+      return okResult("ok");
+    });
+  const healer: Healer = async () => ({ tool: "browser__fill", args: { role: "textbox", name: "Value", value: "{{value}}" } });
+
+  it("appends a typed heal entry to the skill's lineage, preserving the explored root", async () => {
+    const explored: LineageEntry = { type: "explored", at: "2026-07-02T00:00:00Z", note: "explored from run r (verified)", runId: "r" };
+    const store = makeStore([{ ...editSkill, lineage: [explored] }]);
+    const { mcp, policy, logger } = healingMocks();
+
+    const r = await replaySkill("set_value", { value: "fixed" }, { store, mcp, policy, logger, healer });
+
+    expect(r.status).toBe("success");
+    const onDisk = JSON.parse(readFileSync(store.pathOf("set_value"), "utf-8")) as Skill;
+    expect(onDisk.lineage).toHaveLength(2);
+    expect(onDisk.lineage![0]).toEqual(explored); // the root is never rewritten
+    expect(onDisk.lineage![1]!.type).toBe("heal");
+    expect(onDisk.lineage![1]!.stepIndex).toBe(0);
+    expect(onDisk.lineage![1]!.runId).toBe("test-run");
+    expect(onDisk.lineage![1]!.note).toContain("healed");
+  });
+
+  it("proposes re-exploration once the chain reaches the heal threshold", async () => {
+    const priorHeals: LineageEntry[] = [
+      { type: "explored", at: "2026-07-02T00:00:00Z", note: "explored from run r (verified)" },
+      ...Array.from({ length: REEXPLORE_HEAL_THRESHOLD - 1 }, (_, i) => ({
+        type: "heal" as const,
+        at: "2026-07-03T00:00:00Z",
+        note: `step 0 healed earlier (#${i + 1})`,
+      })),
+    ];
+    const store = makeStore([{ ...editSkill, lineage: priorHeals }]);
+    const { mcp, policy, logger, events } = healingMocks();
+
+    const r = await replaySkill("set_value", { value: "fixed" }, { store, mcp, policy, logger, healer });
+
+    expect(r.status).toBe("success");
+    expect(r.reExploreProposed).toEqual(["set_value"]);
+    expect(r.summary).toContain("re-explore proposed");
+    const proposal = events.find((e) => e.type === "reexplore_proposed");
+    expect(proposal).toMatchObject({ skill: "set_value", heals: REEXPLORE_HEAL_THRESHOLD });
+  });
+
+  it("stays quiet below the threshold", async () => {
+    const store = makeStore([editSkill]); // no prior lineage: this is heal #1
+    const { mcp, policy, logger, events } = healingMocks();
+
+    const r = await replaySkill("set_value", { value: "fixed" }, { store, mcp, policy, logger, healer });
+
+    expect(r.healsApplied).toBe(1);
+    expect(r.reExploreProposed).toEqual([]);
+    expect(events.some((e) => e.type === "reexplore_proposed")).toBe(false);
+  });
+
+  it("renders a chain and counts only heals", () => {
+    const lineage: LineageEntry[] = [
+      { type: "explored", at: "t", note: "explored from run r (verified)" },
+      { type: "heal", at: "t", note: "step 0 healed" },
+      { type: "human", at: "t", note: "step 2 patched by hand" },
+    ];
+    expect(renderLineage(lineage)).toBe("explored from run r (verified) -> step 0 healed -> step 2 patched by hand");
+    expect(healCount(lineage)).toBe(1);
+    expect(renderLineage(undefined)).toContain("no lineage");
+    expect(healCount(undefined)).toBe(0);
+  });
+});
+
+describe("warm-up prefix", () => {
+  const navSkill: Skill = {
+    kind: "primitive",
+    name: "nav_and_write",
+    description: "navigate, look, then write",
+    params: [{ name: "id", example: "42" }],
+    steps: [
+      { tool: "browser__navigate", args: { url: "https://example.test/{{id}}" } },
+      { tool: "browser__extract", args: { selector: "#title", format: "text" } },
+      { tool: "browser__fill", args: { selector: "#value", value: "x" } },
+      { tool: "browser__extract", args: { selector: "#after", format: "text" } },
+    ],
+    postCondition: { tool: "browser__extract", args: { selector: "#value", format: "value" }, expectPattern: "x" },
+    source: SOURCE,
+  };
+
+  it("takes the leading read-only steps and stops at the first write", () => {
+    const store = makeStore([navSkill]);
+    const plan = resolvePlan(store, "nav_and_write", { id: "42" });
+    const prefix = readOnlyPrefix(plan);
+    // navigate + extract, stopping before the fill -- the trailing extract
+    // after the write is NOT part of the prefix.
+    expect(prefix.map((p) => p.step.tool)).toEqual(["browser__navigate", "browser__extract"]);
+  });
+
+  it("is empty when the skill writes immediately (nothing safe to pre-flight)", () => {
+    const store = makeStore([editSkill]);
+    const plan = resolvePlan(store, "set_value", { value: "v" });
+    expect(readOnlyPrefix(plan)).toEqual([]);
+  });
+
+  it("executes only the read-only prefix and never the write", async () => {
+    const store = makeStore([navSkill]);
+    const { mcp, policy, logger, calls } = makeMocks(() => okResult("ok"));
+
+    const w = await warmUpSkill("nav_and_write", { id: "42" }, { store, mcp, policy, logger });
+
+    expect(w.ok).toBe(true);
+    expect(w.stepsRun).toBe(2);
+    expect(calls.map((c) => c.tool)).toEqual(["browser__navigate", "browser__extract"]);
+    expect(calls.some((c) => c.tool === "browser__fill")).toBe(false);
+    // Params reached the prefix.
+    expect(calls[0]!.args.url).toBe("https://example.test/42");
+  });
+
+  it("reports failure when the prefix breaks -- the batch's abort signal", async () => {
+    const store = makeStore([navSkill]);
+    const { mcp, policy, logger } = makeMocks((tool) =>
+      tool === "browser__navigate" ? errResult("net::ERR_CONNECTION_REFUSED") : okResult("ok"),
+    );
+
+    const w = await warmUpSkill("nav_and_write", { id: "42" }, { store, mcp, policy, logger });
+
+    expect(w.ok).toBe(false);
+    expect(w.summary).toContain("warm-up failed");
+    expect(w.summary).toContain("browser__navigate");
+  });
+
+  it("succeeds trivially when there is no prefix to run", async () => {
+    const store = makeStore([editSkill]);
+    const { mcp, policy, logger, calls } = makeMocks(() => okResult("ok"));
+
+    const w = await warmUpSkill("set_value", { value: "v" }, { store, mcp, policy, logger });
+
+    expect(w.ok).toBe(true);
+    expect(w.stepsRun).toBe(0);
+    expect(calls).toEqual([]); // nothing executed: no write was risked
+  });
+
+  it("makes no LLM calls and heals nothing -- it only reports", async () => {
+    const store = makeStore([navSkill]);
+    const { mcp, policy, logger } = makeMocks((tool) =>
+      tool === "browser__navigate" ? errResult("boom") : okResult("ok"),
+    );
+    const healer = vi.fn();
+    const w = await warmUpSkill("nav_and_write", { id: "42" }, { store, mcp, policy, logger, healer: healer as unknown as Healer });
+    expect(w.ok).toBe(false);
+    expect(healer).not.toHaveBeenCalled();
   });
 });
 
