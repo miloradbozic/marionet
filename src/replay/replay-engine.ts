@@ -313,6 +313,7 @@ export function resolvePlan(store: SkillStore, name: string, params: Record<stri
 export async function replaySkill(name: string, params: Record<string, string>, opts: ReplayEngineOptions): Promise<ReplayOutcome> {
   const confirm: ConfirmFn = opts.confirm ?? ((tool, args, rule, ctx) => confirmToolCall(tool, args, rule as never, ctx));
   const maxHeals = opts.maxHeals ?? 3;
+  let healsAttempted = 0;
   const outcome: ReplayOutcome = { status: "success", summary: "", stepsExecuted: 0, healsApplied: 0, llmCalls: 0, primitivesRun: [], primitivesSkipped: [], reExploreProposed: [] };
 
   let plan: PlanEntry[];
@@ -376,6 +377,15 @@ export async function replaySkill(name: string, params: Record<string, string>, 
       }
       outcome.primitivesRun.push(skill.name);
 
+      // A patch is a PROPOSAL until this primitive's post-condition proves it
+      // (P22). Holding them here is what stops a dead session from corrupting
+      // the library: on a login wall the healer re-grounds "click Save" onto
+      // some button that genuinely exists, the click succeeds, and a
+      // promote-on-step-success rule would write that into the skill file
+      // forever -- for every flow composing it -- even though the very next
+      // read-back proves the row did nothing.
+      const pendingPatches: Array<{ stepIndex: number; patched: SkillStep; replaced: SkillStep }> = [];
+
       for (let i = 0; i < skill.steps.length; i++) {
         const step = skill.steps[i]!;
         const ctx = `${skill.name}[${i}]`;
@@ -398,7 +408,11 @@ export async function replaySkill(name: string, params: Record<string, string>, 
           lastError = r.text;
         }
 
-        if (!ok && opts.healer && outcome.healsApplied < maxHeals) {
+        // Budget on heals ATTEMPTED, not promoted: the ceiling exists to bound
+        // LLM spend, and a heal costs its call whether or not it earns its way
+        // into the file.
+        if (!ok && opts.healer && healsAttempted < maxHeals) {
+          healsAttempted++;
           const patched = await heal(skill, i, step, entry.params, lastError, opts, outcome);
           if (patched) {
             const patchArgs = substituteArgs(patched.args, entry.params);
@@ -413,8 +427,7 @@ export async function replaySkill(name: string, params: Record<string, string>, 
               lastError = r.text;
             }
             if (healed) {
-              persistPatch(opts.store, skill.name, i, patched, opts.logger, outcome);
-              outcome.healsApplied++;
+              pendingPatches.push({ stepIndex: i, patched, replaced: step });
               ok = true;
             }
           }
@@ -448,10 +461,34 @@ export async function replaySkill(name: string, params: Record<string, string>, 
       }
       opts.logger.log({ type: "verification", tool: post.tool, args: postArgs, expectPattern: pattern, matched, isError: !r.ok, resultText: r.text.slice(0, 2000), skill: skill.name });
       if (!matched) {
+        // The post-condition is the only evidence a patch was right. Without
+        // it, every pending patch is discarded -- logged with both versions so
+        // a human can see what was proposed and why it was not believed.
+        for (const p of pendingPatches) {
+          opts.logger.log({
+            type: "heal_discarded",
+            skill: skill.name,
+            stepIndex: p.stepIndex,
+            reason: "post-condition failed after the patch ran; the patch is unproven",
+            from: p.replaced,
+            to: p.patched,
+            expectPattern: pattern,
+            resultText: r.text.slice(0, 500),
+          });
+        }
         outcome.status = "failure";
-        outcome.summary = `post-condition of "${skill.name}" failed: result did not match /${pattern}/ (got: ${r.text.slice(0, 300)})`;
+        outcome.summary =
+          `post-condition of "${skill.name}" failed: result did not match /${pattern}/ (got: ${r.text.slice(0, 300)})` +
+          (pendingPatches.length ? ` -- ${pendingPatches.length} heal patch(es) discarded unproven` : "");
         opts.logger.log({ type: "replay_finish", ...outcome });
         return outcome;
+      }
+
+      // Proven: now the patches earn their place in the library, and one heal
+      // fixes every flow composing this skill.
+      for (const p of pendingPatches) {
+        persistPatch(opts.store, skill.name, p.stepIndex, p.patched, opts.logger, outcome);
+        outcome.healsApplied++;
       }
       outcome.finalRead = r.text;
       outcome.finalVerification = { tool: post.tool, args: postArgs, expectPattern: pattern };

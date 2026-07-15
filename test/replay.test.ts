@@ -386,6 +386,36 @@ describe("self-heal", () => {
     expect(events.some((e) => e.type === "heal_applied")).toBe(true);
   });
 
+  it("does NOT promote a patch whose post-condition fails (P22: a patch is a proposal)", async () => {
+    // The scenario that makes this load-bearing: a session dies mid-batch, the
+    // page becomes a login wall, and the healer re-grounds "click Save" onto
+    // some button that really is on the page. The CLICK succeeds -- so a
+    // promote-on-step-success rule writes that patch into the skill file -- but
+    // the post-condition then fails, proving the patch was wrong. The skill
+    // must come out of this untouched, or one dead session permanently
+    // corrupts every flow composing it.
+    const store = makeStore([editSkill]);
+    const before = readFileSync(store.pathOf("set_value"), "utf-8");
+    const { mcp, policy, logger, events } = makeMocks((tool, args) => {
+      if (tool === "browser__fill" && args.selector === "#value") return errResult("selector not found");
+      if (tool === "browser__fill" && args.role === "button") return okResult("Clicked"); // the patch "works"...
+      if (tool === "browser__snapshot") return okResult('e1 button "Log in"');
+      if (tool === "browser__eval") return okResult('"WRONG"'); // ...but proves nothing
+      return okResult("ok");
+    });
+    const healer: Healer = async () => ({ tool: "browser__fill", args: { role: "button", name: "Log in", value: "{{value}}" } });
+
+    const r = await replaySkill("set_value", { value: "fixed" }, { store, mcp, policy, logger, healer, postRetryDelayMs: 0 });
+
+    expect(r.status).toBe("failure");
+    expect(r.summary).toContain("post-condition");
+    // The skill file is byte-identical: an unproven patch never reached disk.
+    expect(readFileSync(store.pathOf("set_value"), "utf-8")).toBe(before);
+    expect(r.healsApplied).toBe(0); // nothing was promoted, so nothing was healed
+    expect(events.some((e) => e.type === "heal_applied")).toBe(false);
+    expect(events.some((e) => e.type === "heal_discarded")).toBe(true);
+  });
+
   it("respects the heal budget and fails without a healer", async () => {
     const store = makeStore([editSkill]);
     const { mcp, policy, logger } = makeMocks((tool) =>

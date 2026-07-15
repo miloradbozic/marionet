@@ -16,6 +16,7 @@ import { parseEvents } from "./compiler/trajectory.js";
 import { writeSkillFiles, appendPlaybookNotes } from "./compiler/emit.js";
 import { SkillStore } from "./replay/skill-store.js";
 import { replaySkill, warmUpSkill } from "./replay/replay-engine.js";
+import { runBatch, type BatchOutcome } from "./replay/batch.js";
 import { llmHealer, type Healer } from "./replay/heal.js";
 import type { SkillRunner } from "./loop/run-skill-tool.js";
 import { healCount, isFlowSkill, REEXPLORE_HEAL_THRESHOLD, renderLineage } from "./compiler/skill.types.js";
@@ -382,6 +383,7 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
 
   let failures = 0;
   let warmUpAborted = false;
+  let batch: BatchOutcome | undefined;
   try {
     // Warm-up before a batch: run the read-only prefix once so a dead session
     // or a redesigned page surfaces now, with nothing written, instead of at
@@ -399,17 +401,27 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
       }
     }
 
-    for (const [i, params] of rows.entries()) {
-      if (rows.length > 1) console.log(`\n--- row ${i + 1}/${rows.length}: ${JSON.stringify(params)}`);
-      const r = await replaySkill(cliArgs.skillName, params, { store, mcp, policy, logger, healer });
-      if (r.status !== "success") failures++;
-      console.log(`${r.status === "success" ? "ok " : "FAIL"} ${r.summary}`);
-    }
+    batch = await runBatch({
+      rows,
+      runOne: (params) => replaySkill(cliArgs.skillName, params, { store, mcp, policy, logger, healer }),
+      onRowStart: (params, i, total) => {
+        if (total > 1) console.log(`\n--- row ${i + 1}/${total}: ${JSON.stringify(params)}`);
+      },
+      onRowEnd: (r) => console.log(`${r.status === "success" ? "ok " : "FAIL"} ${r.summary}`),
+      onTrip: (o) => {
+        console.error(`\nStopping: ${o.trippedAfter} rows failed in a row, so this is no longer about the row --`);
+        console.error(`the session or the site changed under the batch. ${o.abandoned} row(s) left untried.`);
+        console.error(`Fix the cause and re-run; already-processed rows are in ${logger.runDir}.`);
+      },
+    });
+    failures = batch.failed;
   } finally {
     const ok = failures === 0 && !warmUpAborted;
     logger.finalize(ok ? "success" : "failure");
     if (warmUpAborted) console.log(`\n0/${rows.length} rows attempted (warm-up failed before the first write)`);
-    else if (rows.length > 1) console.log(`\n${rows.length - failures}/${rows.length} rows succeeded`);
+    else if (rows.length > 1) {
+      console.log(`\n${batch?.succeeded ?? 0}/${rows.length} rows succeeded` + (batch?.abandoned ? `, ${batch.abandoned} untried` : ""));
+    }
     console.log(`log: ${logger.runDir}`);
     await mcp.closeAll();
     process.exit(ok ? 0 : 1);
