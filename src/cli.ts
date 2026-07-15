@@ -9,7 +9,8 @@ import { renderTranscript } from "./logging/transcript-renderer.js";
 import { computeRunStats, renderRunStats } from "./logging/run-stats.js";
 import { runAgentLoop } from "./loop/agent-loop.js";
 import { createLlmClient } from "./llm-client.js";
-import { compileRun } from "./compiler/compile.js";
+import { compileRun, type CompileResult } from "./compiler/compile.js";
+import { describeLocator, scoreLocator } from "./compiler/stability.js";
 import { llmSegmenter, monolithSegmenter, type Segmenter } from "./compiler/segment.js";
 import { parseEvents } from "./compiler/trajectory.js";
 import { writeSkillFiles, appendPlaybookNotes } from "./compiler/emit.js";
@@ -257,6 +258,29 @@ async function compileCommand(repoRoot: string, runId: string | undefined, useHe
     const playbookPath = appendPlaybookNotes(repoRoot, meta.client, meta.runId, result.playbookNotes);
     if (playbookPath) console.log(`Playbook updated: ${playbookPath} (+${result.playbookNotes.length} note(s))`);
   }
+
+  reportWeakAnchors(result.weakAnchors);
+}
+
+/**
+ * Anchor durability, reported at birth rather than on the first failed replay
+ * months later. Fragile anchors are named loudly because the compiler just
+ * wrote a skill that is dated: not because the site will be redesigned, but
+ * because the anchor carries content that moves on its own.
+ */
+function reportWeakAnchors(weak: CompileResult["weakAnchors"]): void {
+  if (!weak.length) return;
+  const fragile = weak.filter((w) => w.score === "fragile");
+  console.log(`\nAnchor durability: ${fragile.length} fragile, ${weak.length - fragile.length} weak`);
+  for (const w of weak) {
+    const label = w.score === "fragile" ? "FRAGILE" : "weak   ";
+    console.log(`  ${label} ${w.skill}[${w.stepIndex}] (${w.tool}) -> ${describeLocator(w.locator)}`);
+    for (const r of w.reasons) console.log(`          - ${r}`);
+  }
+  if (fragile.length) {
+    console.log(`\n  A fragile anchor rots without a redeploy. Prefer a step that targets an authored`);
+    console.log(`  label (a button/link/field name) over one that matches a whole row or card.`);
+  }
 }
 
 /** Minimal CSV: first row = param names; commas split cells; surrounding quotes stripped. */
@@ -408,6 +432,19 @@ function skillsCommand(repoRoot: string, clientName: string | undefined): void {
     console.log(`           lineage: ${renderLineage(s.lineage)}`);
     if (healCount(s.lineage) >= REEXPLORE_HEAL_THRESHOLD) {
       console.log(`           ^ ${healCount(s.lineage)} heals -- consider re-exploring this flow instead of patching it further.`);
+    }
+
+    // Score on read, not from the stored verdict: skills compiled before the
+    // scorer existed carry no stability field, and those are exactly the ones
+    // most worth auditing.
+    if (!isFlowSkill(s)) {
+      for (const [i, step] of s.steps.entries()) {
+        if (!step.locator) continue;
+        const v = scoreLocator(step.locator);
+        if (v.score === "stable") continue;
+        console.log(`           ${v.score === "fragile" ? "FRAGILE" : "weak"} anchor at step ${i}: ${describeLocator(step.locator)}`);
+        for (const r of v.reasons) console.log(`             - ${r}`);
+      }
     }
   }
 }

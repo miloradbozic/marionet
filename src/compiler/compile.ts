@@ -1,7 +1,8 @@
 import { detectLiterals, buildMapping, parameterizeStep, parameterizePostCondition } from "./parameterize.js";
 import { assertCompilable, extractTrajectory, type RunEvent } from "./trajectory.js";
 import { monolithSegmenter, validateSegmentation, type Segmentation, type Segmenter } from "./segment.js";
-import type { FlowSkill, LineageEntry, Skill, SkillParam, SkillPostCondition, SkillSource, SkillStep } from "./skill.types.js";
+import type { FlowSkill, LineageEntry, SemanticLocator, Skill, SkillParam, SkillPostCondition, SkillSource, SkillStep } from "./skill.types.js";
+import { scoreLocator } from "./stability.js";
 
 export interface CompileInput {
   events: RunEvent[];
@@ -22,6 +23,17 @@ export interface CompileResult {
   playbookNotes: string[];
   /** Set when the LLM segmentation was rejected and the monolith fallback was used. */
   fallbackReason?: string;
+  /** Anchors that scored below "stable" -- reported at birth, not on first failure. */
+  weakAnchors: WeakAnchor[];
+}
+
+export interface WeakAnchor {
+  skill: string;
+  stepIndex: number;
+  tool: string;
+  locator: SemanticLocator;
+  score: "weak" | "fragile";
+  reasons: string[];
 }
 
 /**
@@ -81,8 +93,29 @@ export async function compileRun(input: CompileInput): Promise<CompileResult> {
   const paramsUsedIn = (json: string): SkillParam[] =>
     literals.filter((lit) => json.includes(`{{${nameFor(lit)}}}`)).map((lit) => ({ name: nameFor(lit), example: lit }));
 
+  // Score every anchor as the skill is born. An anchor is scored AFTER
+  // parameterization so a substituted {{param}} isn't mistaken for a
+  // run-specific literal -- the placeholder is the compiler working, not drift.
+  const weakAnchors: WeakAnchor[] = [];
+  // stepIndex is skill-local: it is what persistPatch and the lineage use.
+  const scoreSteps = (skillName: string, steps: SkillStep[]): SkillStep[] =>
+    steps.map((step, i) => {
+      if (!step.locator) return step;
+      const verdict = scoreLocator(step.locator);
+      if (verdict.score === "stable") return step;
+      weakAnchors.push({
+        skill: skillName,
+        stepIndex: i,
+        tool: step.tool,
+        locator: step.locator,
+        score: verdict.score,
+        reasons: verdict.reasons,
+      });
+      return { ...step, locator: { ...step.locator, stability: { score: verdict.score, reasons: verdict.reasons } } };
+    });
+
   const primitives: Skill[] = seg.segments.map((spec, i) => {
-    const segSteps = substitutedSteps.slice(spec.firstStep, spec.lastStep + 1);
+    const segSteps = scoreSteps(spec.name, substitutedSteps.slice(spec.firstStep, spec.lastStep + 1));
     const isLast = i === seg.segments.length - 1;
     const post: SkillPostCondition = isLast ? finalPost : parameterizePostCondition(spec.postCondition!, mapping);
     return {
@@ -115,5 +148,5 @@ export async function compileRun(input: CompileInput): Promise<CompileResult> {
     };
   }
 
-  return { primitives, flow, playbookNotes: seg.playbookNotes, ...(fallbackReason ? { fallbackReason } : {}) };
+  return { primitives, flow, playbookNotes: seg.playbookNotes, weakAnchors, ...(fallbackReason ? { fallbackReason } : {}) };
 }

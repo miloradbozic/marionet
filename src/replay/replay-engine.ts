@@ -2,7 +2,8 @@ import type { McpClientManager, McpToolResult } from "../mcp/mcp-client-manager.
 import type { PolicyEngine } from "../policy/policy-engine.js";
 import type { RunLogger } from "../logging/run-logger.js";
 import { confirmToolCall } from "../confirm/cli-prompt.js";
-import { healCount, isFlowSkill, REEXPLORE_HEAL_THRESHOLD, renderLineage, type LineageEntry, type Skill, type SkillStep } from "../compiler/skill.types.js";
+import { healCount, isFlowSkill, REEXPLORE_HEAL_THRESHOLD, renderLineage, type LineageEntry, type SemanticLocator, type Skill, type SkillStep } from "../compiler/skill.types.js";
+import { isFragile } from "../compiler/stability.js";
 import { ParamError, substituteArgs, substitutePattern, substituteString } from "./params.js";
 import type { SkillStore } from "./skill-store.js";
 import type { Healer } from "./heal.js";
@@ -140,22 +141,31 @@ export function readOnlyPrefix(plan: PlanEntry[]): PrefixStep[] {
  * heal patch's `locator` is not guaranteed to be duplicated into its `args`
  * (the heal LLM sometimes fills one and not the other), so patches need the
  * same fallback original steps get, not a single bare attempt.
+ *
+ * ...unless the anchor is FRAGILE (`stability.ts`), in which case the order
+ * inverts. Semantic-first is justified by role+name outliving CSS churn -- but
+ * an anchor whose name carries a completeness percentage or an "updated"
+ * timestamp outlives nothing: it is stale as soon as the record is touched,
+ * with no redeploy involved. Leading with it means every replay pays a failed
+ * attempt before falling back to the selector that was going to work anyway.
+ * Scored live rather than read from the stored verdict, so skills compiled
+ * before the scorer existed get the same treatment.
  */
 function buildAttempts(
   tool: string,
   args: Record<string, unknown>,
-  locator: { role: string; name: string } | undefined,
+  locator: SemanticLocator | undefined,
   params: Record<string, string>,
 ): Array<{ args: Record<string, unknown>; kind: string }> {
-  const attempts: Array<{ args: Record<string, unknown>; kind: string }> = [];
+  const semantic: Array<{ args: Record<string, unknown>; kind: string }> = [];
   if (locator && SEMANTIC_TOOLS.has(tool)) {
     const locatorName = substituteString(locator.name, params);
     const semanticArgs: Record<string, unknown> = { role: locator.role, name: locatorName };
     if (tool === "browser__fill" && typeof args.value === "string") semanticArgs.value = args.value;
-    attempts.push({ args: semanticArgs, kind: "semantic" });
+    semantic.push({ args: semanticArgs, kind: isFragile(locator) ? "semantic:fragile" : "semantic" });
   }
-  attempts.push({ args, kind: "selector" });
-  return attempts;
+  const selector = [{ args, kind: "selector" }];
+  return isFragile(locator) ? [...selector, ...semantic] : [...semantic, ...selector];
 }
 
 class ReplayBlocked extends Error {}

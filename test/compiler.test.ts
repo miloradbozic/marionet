@@ -15,8 +15,31 @@ import { monolithSegmenter, validateSegmentation, type Segmenter, type Segmentat
 import { healCount } from "../src/compiler/skill.types.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const fixtureEvents = parseEvents(readFileSync(path.join(here, "fixtures", "akeneo-set-ean.events.jsonl"), "utf-8"));
+const FIXTURE_PATH = path.join(here, "fixtures", "akeneo-set-ean.events.jsonl");
+const fixtureEvents = parseEvents(readFileSync(FIXTURE_PATH, "utf-8"));
 const TASK = "In Akeneo, open product 901384900 and set the EAN attribute to 1234567890999";
+
+/**
+ * The recorded fixture predates semantic locators, so no step in it carries
+ * one. Graft a ` [target: role "name"]` suffix onto a tool's result the way
+ * the browser tools emit it today, so anchor-scoring can be exercised against
+ * the real trajectory instead of a hand-built one.
+ */
+function fixtureWithLocator(tool: string, role: string, name: string) {
+  return parseEvents(
+    readFileSync(FIXTURE_PATH, "utf-8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const e = JSON.parse(line) as { type: string; tool?: string; isError?: boolean; content?: Array<{ type: string; text: string }> };
+        if (e.type === "tool_result" && e.tool === tool && !e.isError && e.content?.[0]) {
+          e.content[0].text = `${e.content[0].text} [target: ${role} ${JSON.stringify(name)}]`;
+        }
+        return JSON.stringify(e);
+      })
+      .join("\n"),
+  );
+}
 
 describe("trajectory extraction", () => {
   it("extracts executed steps and the passing verification as a post-condition", () => {
@@ -265,6 +288,47 @@ describe("compileRun", () => {
       expect(root.note).toContain("test-run");
       expect(healCount(skill.lineage)).toBe(0); // a fresh skill has no scar tissue
     }
+  });
+
+  it("leaves a stable anchor terse: no verdict, no bloat", async () => {
+    const result = await compileRun({
+      events: fixtureWithLocator("browser__click_text", "button", "Save"),
+      runId: "test-run",
+      task: TASK,
+      model: "test-model",
+      metaStatus: "success",
+      segmenter: twoSegmentSegmenter,
+    });
+
+    const anchored = result.primitives.flatMap((p) => p.steps).filter((s) => s.locator);
+    expect(anchored.length).toBeGreaterThan(0); // the graft landed
+    expect(result.weakAnchors).toEqual([]);
+    expect(anchored.every((s) => s.locator!.stability === undefined)).toBe(true);
+  });
+
+  it("flags a rotting anchor at birth and records why, on the skill and in the result", async () => {
+    // The exact shape that really got compiled into the opari library: a
+    // container role whose name carries a completeness percentage and an
+    // "updated" timestamp -- both of which move when you edit the product the
+    // skill exists to edit. No redeploy required.
+    const result = await compileRun({
+      events: fixtureWithLocator("browser__click_text", "row", "901384900 Teebereiter Enabled 76% 11/21/2026"),
+      runId: "r",
+      task: TASK,
+      model: "m",
+      metaStatus: "success",
+      segmenter: twoSegmentSegmenter,
+    });
+
+    const fragile = result.weakAnchors.filter((w) => w.score === "fragile");
+    expect(fragile).toHaveLength(1);
+    expect(fragile[0]!.reasons.some((r) => r.includes("percentage"))).toBe(true);
+    expect(fragile[0]!.reasons.some((r) => r.includes("date"))).toBe(true);
+
+    // The verdict travels with the skill, not just the console output.
+    const stamped = result.primitives.flatMap((p) => p.steps).find((s) => s.locator?.stability);
+    expect(stamped!.locator!.stability!.score).toBe("fragile");
+    expect(stamped!.locator!.stability!.reasons.length).toBeGreaterThan(0);
   });
 
   it("falls back to a monolith when the segmentation is invalid (rogue paramNames)", async () => {

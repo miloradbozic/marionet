@@ -311,6 +311,33 @@ describe("semantic-first targeting", () => {
     expect(calls.filter((c) => c.tool === "browser__fill").length).toBe(1);
   });
 
+  it("tries the selector FIRST when the anchor is fragile, and still falls back to it", async () => {
+    // A row anchor carrying a completeness percentage: stale the moment the
+    // record is edited, so leading with it just buys a failed attempt.
+    const fragileSkill: Skill = {
+      ...editSkill,
+      name: "set_value_fragile",
+      steps: [
+        {
+          tool: "browser__fill",
+          args: { selector: "#value", value: "{{value}}" },
+          locator: { role: "row", name: "{{value}} Teebereiter Enabled 76% 11/21/2026" },
+        },
+      ],
+    };
+    const store = makeStore([fragileSkill]);
+    const { mcp, policy, logger, calls } = makeMocks((tool) =>
+      tool === "browser__eval" ? okResult('"v1"') : okResult("Filled"),
+    );
+
+    const r = await replaySkill("set_value_fragile", { value: "v1" }, { store, mcp, policy, logger });
+
+    expect(r.status).toBe("success");
+    // Selector went first; the fragile anchor was never even attempted.
+    expect(calls[0]!.args).toEqual({ selector: "#value", value: "v1" });
+    expect(calls.filter((c) => c.tool === "browser__fill").length).toBe(1);
+  });
+
   it("falls back to the recorded selector when semantic targeting fails", async () => {
     const store = makeStore([semanticSkill]);
     const { mcp, policy, logger, calls } = makeMocks((tool, args) => {

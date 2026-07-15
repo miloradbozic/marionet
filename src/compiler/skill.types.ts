@@ -23,6 +23,15 @@
 export interface SemanticLocator {
   role: string;
   name: string;
+  /**
+   * Compile-time durability verdict (`stability.ts`). Absent means the anchor
+   * scored "stable" -- so a good anchor stays exactly as terse as it was, and
+   * only the ones worth worrying about carry the note explaining why.
+   */
+  stability?: {
+    score: "weak" | "fragile";
+    reasons: string[];
+  };
 }
 
 export interface SkillStep {
