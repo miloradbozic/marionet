@@ -581,6 +581,124 @@ describe("warm-up prefix", () => {
   });
 });
 
+describe("interference: auth loss is a pause, not a failure (P40)", () => {
+  /**
+   * Mock world with a mutable session: while logged out, steps fail and the
+   * page shows a password field. The interference handler "logs in" (fixes
+   * the world), and the run must retry the exact step and continue -- no
+   * heal, no row failure.
+   */
+  function makeSessionMocks(startLoggedIn: boolean) {
+    let loggedIn = startLoggedIn;
+    const mocks = makeMocks((tool, args) => {
+      if (tool === "browser__enumerate" && args.selector === 'input[type="password"]') {
+        return okResult(loggedIn ? "[]" : '[{"text":"Password"}]');
+      }
+      if (tool === "browser__eval") return okResult('"abc"');
+      if (!loggedIn) return errResult("locator timeout: element not found");
+      return okResult("Filled");
+    });
+    return { ...mocks, logIn: () => (loggedIn = true) };
+  }
+
+  it("pauses at a login wall, retries the same step after resume, and succeeds without healing", async () => {
+    const store = makeStore([editSkill]);
+    const m = makeSessionMocks(false);
+    const healer = vi.fn();
+    const onInterference = vi.fn(async (_e: { kind: string; skill: string; stepIndex: number }) => {
+      m.logIn(); // the human re-authenticates in their own browser
+      return "resume" as const;
+    });
+
+    const r = await replaySkill("set_value", { value: "abc" }, {
+      store, mcp: m.mcp, policy: m.policy, logger: m.logger,
+      healer: healer as unknown as Healer, onInterference,
+    });
+
+    expect(r.status).toBe("success");
+    expect(onInterference).toHaveBeenCalledOnce();
+    expect(onInterference.mock.calls[0]![0]).toMatchObject({ kind: "auth_loss", skill: "set_value", stepIndex: 0 });
+    expect(healer).not.toHaveBeenCalled(); // the healer never saw the login wall
+    expect(r.llmCalls).toBe(0); // a pause costs zero model calls
+    expect(m.events.some((e) => e.type === "interference_detected")).toBe(true);
+    // The step was retried verbatim: same fill, same selector.
+    const fills = m.calls.filter((c) => c.tool === "browser__fill" && c.args.selector === "#value");
+    expect(fills.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("aborts cleanly when the operator declines to resume", async () => {
+    const store = makeStore([editSkill]);
+    const m = makeSessionMocks(false);
+    const onInterference = vi.fn(async () => "abort" as const);
+
+    const r = await replaySkill("set_value", { value: "abc" }, { store, mcp: m.mcp, policy: m.policy, logger: m.logger, onInterference });
+
+    expect(r.status).toBe("blocked");
+    expect(r.summary).toContain("auth_loss");
+  });
+
+  it("does not consult the handler when the failure is not a login wall", async () => {
+    const store = makeStore([editSkill]);
+    const { mcp, policy, logger } = makeMocks((tool, args) => {
+      if (tool === "browser__enumerate" && args.selector === 'input[type="password"]') return okResult("[]");
+      return tool === "browser__fill" ? errResult("nope") : okResult("ok");
+    });
+    const onInterference = vi.fn();
+
+    const r = await replaySkill("set_value", { value: "x" }, { store, mcp, policy, logger, onInterference });
+
+    expect(r.status).toBe("failure"); // ordinary failure path, untouched
+    expect(onInterference).not.toHaveBeenCalled();
+  });
+
+  it("gives up after the pause cap when logging in never fixes the step", async () => {
+    const store = makeStore([editSkill]);
+    // Perpetually logged out: the wall stays up no matter how often the human "resumes".
+    const m = makeSessionMocks(false);
+    const onInterference = vi.fn(async () => "resume" as const);
+
+    const r = await replaySkill("set_value", { value: "x" }, { store, mcp: m.mcp, policy: m.policy, logger: m.logger, onInterference });
+
+    expect(r.status).toBe("failure");
+    expect(onInterference).toHaveBeenCalledTimes(3); // MAX_INTERFERENCE_PAUSES
+  });
+
+  it("pauses the warm-up at a login wall instead of aborting the batch", async () => {
+    const navSkill: Skill = {
+      kind: "primitive",
+      name: "nav_first",
+      description: "",
+      params: [],
+      steps: [
+        { tool: "browser__navigate", args: { url: "https://x.test" } },
+        { tool: "browser__wait_for", args: { selector: "#grid" } },
+        { tool: "browser__fill", args: { selector: "#q", value: "x" } },
+      ],
+      postCondition: { tool: "browser__eval", args: { expression: "1" }, expectPattern: "." },
+      source: SOURCE,
+    };
+    const store = makeStore([navSkill]);
+    let loggedIn = false;
+    const { mcp, policy, logger } = makeMocks((tool, args) => {
+      if (tool === "browser__enumerate" && args.selector === 'input[type="password"]') {
+        return okResult(loggedIn ? "[]" : '[{"text":"Password"}]');
+      }
+      if (tool === "browser__wait_for" && !loggedIn) return errResult("timeout waiting for #grid");
+      return okResult("ok");
+    });
+    const onInterference = vi.fn(async () => {
+      loggedIn = true;
+      return "resume" as const;
+    });
+
+    const w = await warmUpSkill("nav_first", {}, { store, mcp, policy, logger, onInterference });
+
+    expect(w.ok).toBe(true); // the batch proceeds after the human re-authenticated
+    expect(onInterference).toHaveBeenCalledOnce();
+    expect(w.stepsRun).toBe(2); // navigate + wait_for; the fill is not read-only
+  });
+});
+
 describe("validatePatch", () => {
   it("rejects unknown tools and missing args", () => {
     expect(() => validatePatch({ tool: "browser__teleport", args: {} }, ["browser__fill"])).toThrow(HealError);

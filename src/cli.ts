@@ -17,6 +17,8 @@ import { writeSkillFiles, appendPlaybookNotes } from "./compiler/emit.js";
 import { SkillStore } from "./replay/skill-store.js";
 import { replaySkill, warmUpSkill } from "./replay/replay-engine.js";
 import { runBatch, type BatchOutcome } from "./replay/batch.js";
+import { findLatestBatchRun, planResume } from "./replay/resume.js";
+import { promptInterferencePause } from "./confirm/cli-prompt.js";
 import { llmHealer, type Healer } from "./replay/heal.js";
 import type { SkillRunner } from "./loop/run-skill-tool.js";
 import { healCount, isFlowSkill, REEXPLORE_HEAL_THRESHOLD, renderLineage } from "./compiler/skill.types.js";
@@ -60,7 +62,7 @@ const USAGE =
   "       marionet last [run-id]        (duration, cost, LLM turns, replay-or-not)\n" +
   "       marionet transcript [run-id]\n" +
   "       marionet compile [run-id] [--heuristic]\n" +
-  "       marionet replay [--client <name>] <skill> [--param k=v ...] [--csv <file>] [--no-heal]\n" +
+  "       marionet replay [--client <name>] <skill> [--param k=v ...] [--csv <file>] [--resume] [--no-heal]\n" +
   "       marionet skills [--client <name>]";
 
 function skillsDirFor(repoRoot: string, clientName: string | undefined): string {
@@ -305,10 +307,11 @@ interface ReplayCliArgs {
   params: Record<string, string>;
   csvPath?: string;
   noHeal: boolean;
+  resume: boolean;
 }
 
 function parseReplayArgs(rest: string[]): ReplayCliArgs {
-  const out: ReplayCliArgs = { skillName: "", params: {}, noHeal: false };
+  const out: ReplayCliArgs = { skillName: "", params: {}, noHeal: false, resume: false };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]!;
     if (a === "--client") {
@@ -324,6 +327,8 @@ function parseReplayArgs(rest: string[]): ReplayCliArgs {
       if (!out.csvPath) throw new Error("--csv requires a file path");
     } else if (a === "--no-heal") {
       out.noHeal = true;
+    } else if (a === "--resume") {
+      out.resume = true;
     } else if (!out.skillName) {
       out.skillName = a;
     } else {
@@ -357,9 +362,23 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
     }
   }
 
-  const rows: Array<Record<string, string>> = cliArgs.csvPath
+  let rows: Array<Record<string, string>> = cliArgs.csvPath
     ? parseCsv(cliArgs.csvPath).map((row) => ({ ...cliArgs.params, ...row }))
     : [cliArgs.params];
+
+  // --resume: skip rows the previous batch run of this skill verified as done,
+  // so re-running after a breaker trip or crash never re-submits them.
+  let resumeSkipped: Array<Record<string, string>> = [];
+  let resumeSourceId: string | undefined;
+  if (cliArgs.resume) {
+    if (!cliArgs.csvPath) throw new Error("--resume only applies to --csv batches (a single replay is re-run whole)");
+    const source = findLatestBatchRun(path.join(repoRoot, "runs"), cliArgs.skillName);
+    if (!source) throw new Error(`--resume: no previous "replay ${cliArgs.skillName} --csv" run found in runs/`);
+    const plan = planResume(source, rows);
+    rows = plan.todo;
+    resumeSkipped = plan.skipped;
+    resumeSourceId = source.runId;
+  }
 
   const logger = new RunLogger(path.join(repoRoot, "runs"), {
     task: `replay ${cliArgs.skillName}${cliArgs.csvPath ? ` --csv ${cliArgs.csvPath} (${rows.length} rows)` : ` ${JSON.stringify(cliArgs.params)}`}`,
@@ -374,6 +393,19 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
   console.log(`marionet replay ${logger.runId}`);
   console.log(`skill: ${cliArgs.skillName}${profile ? `  client: ${profile.name}` : ""}`);
 
+  if (cliArgs.resume) {
+    // Re-mark the inherited rows in THIS run's log, so a resume of a resume
+    // still knows about them.
+    for (const params of resumeSkipped) logger.log({ type: "row_skipped_resume", params, verifiedInRun: resumeSourceId });
+    console.log(`resume: ${resumeSkipped.length} row(s) already verified done in run ${resumeSourceId}, ${rows.length} to run`);
+    if (!rows.length) {
+      console.log("Nothing left to do -- every row was verified done by the previous run.");
+      logger.finalize("success");
+      console.log(`log: ${logger.runDir}`);
+      process.exit(0);
+    }
+  }
+
   const mcp = await McpClientManager.connectAll(
     runConfig.mcpServers,
     repoRoot,
@@ -384,6 +416,9 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
   let failures = 0;
   let warmUpAborted = false;
   let batch: BatchOutcome | undefined;
+  // The CLI is interactive, so an expired session pauses for a re-login in the
+  // operator's browser instead of failing rows (P40).
+  const onInterference = (e: { message: string }) => promptInterferencePause(e.message);
   try {
     // Warm-up before a batch: run the read-only prefix once so a dead session
     // or a redesigned page surfaces now, with nothing written, instead of at
@@ -391,7 +426,7 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
     // warm-up, and paying for a second page load to learn what the next step
     // is about to tell us is waste.
     if (rows.length > 1) {
-      const w = await warmUpSkill(cliArgs.skillName, rows[0]!, { store, mcp, policy, logger, healer });
+      const w = await warmUpSkill(cliArgs.skillName, rows[0]!, { store, mcp, policy, logger, healer, onInterference });
       console.log(`${w.ok ? "ok  " : "FAIL"} ${w.summary}`);
       if (!w.ok) {
         console.error(`\nAborting batch of ${rows.length} rows: the warm-up failed, so nothing was written.`);
@@ -403,7 +438,7 @@ async function replayCommand(repoRoot: string, cliArgs: ReplayCliArgs): Promise<
 
     batch = await runBatch({
       rows,
-      runOne: (params) => replaySkill(cliArgs.skillName, params, { store, mcp, policy, logger, healer }),
+      runOne: (params) => replaySkill(cliArgs.skillName, params, { store, mcp, policy, logger, healer, onInterference }),
       onRowStart: (params, i, total) => {
         if (total > 1) console.log(`\n--- row ${i + 1}/${total}: ${JSON.stringify(params)}`);
       },

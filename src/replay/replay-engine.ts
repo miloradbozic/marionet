@@ -40,6 +40,13 @@ export interface ReplayEngineOptions {
   confirm?: ConfirmFn;
   /** Delay before each post-condition re-read (default 2000ms; 0 in tests). */
   postRetryDelayMs?: number;
+  /**
+   * Called when the run hits an interference state (auth loss). Return
+   * "resume" once the human has fixed the world to retry the paused step.
+   * Absent = interference is not handled and the step failure stands (so
+   * non-interactive callers keep today's behavior).
+   */
+  onInterference?: InterferenceHandler;
 }
 
 export interface ReplayOutcome {
@@ -170,6 +177,50 @@ function buildAttempts(
 
 class ReplayBlocked extends Error {}
 
+/**
+ * Interference states (P6): conditions of the page that are nobody's step --
+ * not the skill's fault, not the site's redesign -- and that only a defined
+ * handler should deal with. Auth loss is the first and by far the most common:
+ * sessions expire under long batches, and treating the resulting login wall as
+ * a step failure sends the run down exactly the wrong paths (the healer
+ * happily re-grounds onto the login page; the batch breaker counts it as three
+ * row failures; the row is reported failed when nothing is wrong with it).
+ *
+ * P40: authentication loss is a pause, never a failure and never a
+ * workaround. The human logs in in their own browser (P29 -- their identity,
+ * obtained by them); the run retries from the exact step it paused at.
+ */
+export type InterferenceKind = "auth_loss";
+
+export interface InterferenceEvent {
+  kind: InterferenceKind;
+  skill: string;
+  stepIndex: number;
+  message: string;
+}
+
+export type InterferenceHandler = (event: InterferenceEvent) => Promise<"resume" | "abort">;
+
+/** Pauses per replay before giving up -- a wall the human can't fix by logging in shouldn't loop forever. */
+const MAX_INTERFERENCE_PAUSES = 3;
+
+/**
+ * Cheap read-only probe: does the current page show a password field? Runs
+ * through the same policy-gated executor as every other call, so the probe is
+ * itself auditable and can never exceed what the run may do. Only consulted
+ * after a step has already failed, so it costs nothing on the happy path.
+ */
+async function detectAuthWall(execute: Executor, context: string): Promise<boolean> {
+  const r = await execute("browser__enumerate", { selector: 'input[type="password"]' }, `${context} (auth-wall probe)`);
+  if (!r.ok) return false; // no browser / probe failed: not evidence of a wall
+  try {
+    const matches = JSON.parse(r.text) as unknown;
+    return Array.isArray(matches) && matches.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 type Executor = (tool: string, args: Record<string, unknown>, context: string) => Promise<{ ok: boolean; text: string }>;
 
 /**
@@ -242,22 +293,48 @@ export async function warmUpSkill(name: string, params: Record<string, string>, 
   }
 
   let stepsRun = 0;
+  let pausesTaken = 0;
   try {
     for (const { skill, stepIndex, step, params: stepParams } of prefix) {
       const ctx = `warmup ${skill.name}[${stepIndex}]`;
       const args = substituteArgs(step.args, stepParams);
       const attempts = buildAttempts(step.tool, args, step.locator, stepParams);
 
-      let ok = false;
-      let lastError = "";
-      for (const attempt of attempts) {
-        const r = await execute(step.tool, attempt.args, `${ctx} (${attempt.kind})`);
-        if (r.ok) {
-          ok = true;
-          break;
+      const tryStep = async (): Promise<{ ok: boolean; lastError: string }> => {
+        let lastError = "";
+        for (const attempt of attempts) {
+          const r = await execute(step.tool, attempt.args, `${ctx} (${attempt.kind})`);
+          if (r.ok) return { ok: true, lastError: "" };
+          lastError = r.text;
         }
-        lastError = r.text;
+        return { ok: false, lastError };
+      };
+
+      let { ok, lastError } = await tryStep();
+
+      // The warm-up exists to meet exactly this: the session died since the
+      // last batch. Meeting it should PAUSE for a re-login, not abort -- an
+      // expired session is the human's 30-second fix, not a broken skill.
+      while (!ok && step.tool.startsWith("browser__") && opts.onInterference && pausesTaken < MAX_INTERFERENCE_PAUSES) {
+        if (!(await detectAuthWall(execute, ctx))) break;
+        pausesTaken++;
+        const event: InterferenceEvent = {
+          kind: "auth_loss",
+          skill: skill.name,
+          stepIndex,
+          message: `Warm-up step ${ctx} failed and the page shows a login form -- the session has likely expired. Log in in your browser, then resume; the warm-up will retry.`,
+        };
+        opts.logger.log({ type: "interference_detected", ...event, pausesTaken });
+        const decision = await opts.onInterference(event);
+        opts.logger.log({ type: "interference_decision", kind: event.kind, decision });
+        if (decision === "abort") {
+          const summary = `warm-up aborted by the operator at an auth_loss pause (${ctx})`;
+          opts.logger.log({ type: "warmup_finish", skill: name, ok: false, stepsRun, error: summary });
+          return { ok: false, summary, stepsRun };
+        }
+        ({ ok, lastError } = await tryStep());
       }
+
       if (!ok) {
         const summary = `warm-up failed at ${ctx} (${step.tool}): ${lastError.slice(0, 300)}`;
         opts.logger.log({ type: "warmup_finish", skill: name, ok: false, stepsRun, error: summary });
@@ -314,6 +391,7 @@ export async function replaySkill(name: string, params: Record<string, string>, 
   const confirm: ConfirmFn = opts.confirm ?? ((tool, args, rule, ctx) => confirmToolCall(tool, args, rule as never, ctx));
   const maxHeals = opts.maxHeals ?? 3;
   let healsAttempted = 0;
+  let pausesTaken = 0;
   const outcome: ReplayOutcome = { status: "success", summary: "", stepsExecuted: 0, healsApplied: 0, llmCalls: 0, primitivesRun: [], primitivesSkipped: [], reExploreProposed: [] };
 
   let plan: PlanEntry[];
@@ -397,15 +475,37 @@ export async function replaySkill(name: string, params: Record<string, string>, 
         const args = substituteArgs(step.args, entry.params);
         const attempts = buildAttempts(step.tool, args, step.locator, entry.params);
 
-        let ok = false;
-        let lastError = "";
-        for (const attempt of attempts) {
-          const r = await execute(step.tool, attempt.args, `${ctx} (${attempt.kind})`);
-          if (r.ok) {
-            ok = true;
-            break;
+        const tryStep = async (): Promise<{ ok: boolean; lastError: string }> => {
+          let lastError = "";
+          for (const attempt of attempts) {
+            const r = await execute(step.tool, attempt.args, `${ctx} (${attempt.kind})`);
+            if (r.ok) return { ok: true, lastError: "" };
+            lastError = r.text;
           }
-          lastError = r.text;
+          return { ok: false, lastError };
+        };
+
+        let { ok, lastError } = await tryStep();
+
+        // Interference check comes BEFORE the healer: a login wall is not a
+        // broken step, and waking the healer against it is the pathology --
+        // it will find some element that exists on the login page and
+        // "re-ground" onto it. Pause, let the human restore their session in
+        // their own browser, then retry the same step verbatim.
+        while (!ok && step.tool.startsWith("browser__") && opts.onInterference && pausesTaken < MAX_INTERFERENCE_PAUSES) {
+          if (!(await detectAuthWall(execute, ctx))) break;
+          pausesTaken++;
+          const event: InterferenceEvent = {
+            kind: "auth_loss",
+            skill: skill.name,
+            stepIndex: i,
+            message: `Step ${ctx} failed and the page shows a login form -- the session has likely expired. Log in in your browser (your identity, your session), then resume; the run will retry this exact step.`,
+          };
+          opts.logger.log({ type: "interference_detected", ...event, pausesTaken });
+          const decision = await opts.onInterference(event);
+          opts.logger.log({ type: "interference_decision", kind: event.kind, decision });
+          if (decision === "abort") throw new ReplayBlocked(`run aborted by the operator at an ${event.kind} pause (${ctx})`);
+          ({ ok, lastError } = await tryStep());
         }
 
         // Budget on heals ATTEMPTED, not promoted: the ceiling exists to bound
